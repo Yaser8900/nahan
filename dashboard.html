@@ -1,113 +1,146 @@
-<!DOCTYPE html><html lang="en" class="dark"><head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-      <meta name="apple-mobile-web-app-capable" content="yes">
-      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-      <meta name="mobile-web-app-capable" content="yes">
-      <meta name="theme-color" content="#0d1117">
-      <meta name="apple-mobile-web-app-title" content="Nahan">
-      <meta name="format-detection" content="telephone=no">
-      <meta name="msapplication-tap-highlight" content="no">
-      <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%236366f1'/><text x='50' y='62' font-size='40' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>N</text></svg>">
-      <title>Nahan Gateway</title>
-      <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&amp;display=swap" rel="stylesheet">
-      <script src="https://cdn.jsdelivr.net/gh/itsyebekhe/nahan@main/tailwindcss.js"></script>
-            <script>
-          tailwind.config = {
-    darkMode: 'class',
-    theme: {
-        extend: {
-            fontFamily: { sans: ['Inter', 'sans-serif'], fa: ['Vazirmatn', 'sans-serif'] },
-            colors: {
-                primary: 'var(--color-primary)',
-                darkbg: 'var(--color-bg)',
-                darkcard: 'var(--color-surface)',
-                darkborder: 'var(--color-border)',
-                
-                // Map hardcoded colors in HTML to CSS vars
-                white: '#ffffff',
-                black: '#000',
-                slate: {
-                    50: 'var(--slate-50)',
-                    100: 'var(--slate-100)',
-                    200: 'var(--slate-200)',
-                    300: 'var(--slate-300)',
-                    400: 'var(--slate-400)',
-                    500: 'var(--slate-500)',
-                    600: 'var(--slate-600)',
-                    700: 'var(--slate-700)',
-                    800: 'var(--slate-800)',
-                    900: 'var(--slate-900)',
+ <!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>پنل مدیریت نهان - Nahan Dashboard</title>
+    <script src="tailwindcss.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --border: #334155;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-foreground: #ffffff;
+            --secondary: #475569;
+            --secondary-foreground: #ffffff;
+            --success: #22c55e;
+        }
+        body { background-color: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; }
+        .bg-card { background-color: var(--card); }
+        .border-border { border-color: var(--border); }
+        .text-foreground { color: var(--text); }
+        .text-muted { color: var(--muted); }
+        .bg-primary { background-color: var(--primary); }
+        .text-primary-foreground { color: var(--primary-foreground); }
+        .bg-secondary { background-color: var(--secondary); }
+        .text-secondary-foreground { color: var(--secondary-foreground); }
+        .text-success { color: var(--success); }
+    </style>
+</head>
+<body class="p-6 max-w-6xl mx-auto">
+
+    <header class="flex justify-between items-center mb-8 pb-4 border-b border-border">
+        <h1 class="text-2xl font-bold">🚀 مدیریت پنل نهان (Nahan)</h1>
+        <span class="text-xs text-muted">نسخه v__CURRENT_VERSION__</span>
+    </header>
+
+    <!-- بخش ابزارهای پیشرفته (UUID و اسکنر SenPai) -->
+    <div class="p-6 rounded-2xl bg-card border border-border mb-6 shadow-lg">
+        <h3 class="text-lg font-bold mb-4 text-foreground flex items-center gap-2">
+            <i class="fa-solid fa-toolbox text-blue-400"></i> ابزارها و قابلیت‌های پیشرفته
+        </h3>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            <!-- ۱. UUID Generator -->
+            <div class="p-4 rounded-xl border border-border bg-opacity-50 bg-background">
+                <h4 class="font-semibold mb-2 text-sm text-foreground flex items-center gap-2">
+                    <i class="fa-solid fa-key text-yellow-400"></i> تولیدکننده UUID
+                </h4>
+                <div class="flex gap-2 mb-2">
+                    <input type="text" id="generatedUuid" readonly class="w-full px-3 py-1.5 text-xs rounded-lg border border-border bg-card text-foreground font-mono" placeholder="UUID تولید شده...">
+                    <button onclick="generateUuid()" class="px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded-lg hover:opacity-95 transition">ساخت</button>
+                    <button onclick="copyUuid()" class="px-3 py-1.5 text-xs bg-secondary text-secondary-foreground rounded-lg hover:opacity-95 transition">کپی</button>
+                </div>
+            </div>
+
+            <!-- ۲. SenPai / IP تمیز -->
+            <div class="p-4 rounded-xl border border-border bg-opacity-50 bg-background md:col-span-2">
+                <h4 class="font-semibold mb-2 text-sm text-foreground flex items-center gap-2">
+                    <i class="fa-solid fa-network-wired text-green-400"></i> اسکنر IP تمیز (SenPai)
+                </h4>
+                <div class="flex flex-wrap gap-3 mb-3">
+                    <select id="scanCount" class="px-3 py-1.5 text-xs rounded-lg border border-border bg-card text-foreground">
+                        <option value="100">اسکن 100 IP</option>
+                        <option value="500" selected>اسکن 500 IP (پیش‌فرض)</option>
+                        <option value="5000">اسکن 5000 IP</option>
+                    </select>
+                    <select id="outputLimit" class="px-3 py-1.5 text-xs rounded-lg border border-border bg-card text-foreground">
+                        <option value="50">خروجی 50 IP</option>
+                        <option value="100" selected>خروجی Top 100</option>
+                        <option value="200">خروجی 200 IP</option>
+                    </select>
+                    <button onclick="runSenpaiScan()" class="px-4 py-1.5 text-xs bg-primary text-primary-foreground rounded-lg hover:opacity-95 transition">شروع اسکن و تست Latency</button>
+                </div>
+                <div id="scanResult" class="text-xs text-muted max-h-36 overflow-y-auto p-3 rounded-lg bg-card border border-border font-mono">هنوز اسکن انجام نشده است.</div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- سایر بخش‌های پنل و تنظیمات -->
+    <main class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="p-6 rounded-2xl bg-card border border-border">
+            <h3 class="text-md font-semibold mb-2">وضعیت سیستم</h3>
+            <p class="text-xs text-muted">اتصالات و مانیتورینگ درگاه‌های شبکه فعال هستند.</p>
+        </div>
+    </main>
+
+    <script>
+        // توابع مرتبط با ابزارهای جدید و ارتباط با اندپوینت‌های ورکر
+        async function generateUuid() {
+            try {
+                const res = await fetch('./api/utils/uuid');
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('generatedUuid').value = data.uuid;
                 }
+            } catch (e) {
+                alert('خطا در تولید UUID');
             }
         }
-    }
-}
-</script>
-      
-  <style>
-:root {
-    --color-text: #0f172a;
-    --color-text-muted: #475569;
-    --color-primary: #6366f1; --color-primary-hover: #4f46e5;
-    --color-bg: var(--slate-50);
-    --color-surface: #ffffff;
-    --color-bg-alt: var(--slate-100);
-    --color-border: var(--slate-200);
 
-    /* Light Mode slate mappings */
-    --slate-50: #f8fafc;
-    --slate-100: #f1f5f9;
-    --slate-200: #e2e8f0;
-    --slate-300: #cbd5e1;
-    --slate-400: #94a3b8;
-    --slate-500: #64748b;
-    --slate-600: #475569;
-    --slate-700: #334155;
-    --slate-800: #1e293b;
-    --slate-900: #0f172a;
-}
-html.dark {
-    --color-text: #f1f5f9;
-    --color-text-muted: #cbd5e1;
-    --color-primary: #818cf8; --color-primary-hover: #6366f1;
-    --color-bg: var(--slate-900);
-    --color-surface: var(--slate-800);
-    --color-bg-alt: var(--slate-100);
-    --color-border: var(--slate-200);
+        function copyUuid() {
+            const input = document.getElementById('generatedUuid');
+            if (!input.value) return;
+            navigator.clipboard.writeText(input.value);
+            alert('UUID با موفقیت کپی شد!');
+        }
 
-    /* Dark Mode slate mappings */
-    --slate-50: #090d16;
-    --slate-100: #151b26;
-    --slate-200: #222b3c;
-    --slate-300: #cbd5e1;
-    --slate-400: #94a3b8;
-    --slate-500: #64748b;
-    --slate-600: #475569;
-    --slate-700: #cbd5e1;
-    --slate-800: #0f172a;
-    --slate-900: #090d16;
-}
-/* Ocean Theme */
-html[data-theme="ocean"] {
-    --color-primary: #0ea5e9;
-    --color-bg: var(--slate-50);
-    --color-surface: #ffffff;
-    --color-bg-alt: var(--slate-100);
-    --color-border: var(--slate-200);
-    --color-text: #082f49;
-    --color-text-muted: #0369a1;
-
-    --slate-50: #f0f9ff;
-    --slate-100: #e0f2fe;
-    --slate-200: #bae6fd;
-    --slate-300: #7dd3fc;
-    --slate-400: #38bdf8;
-    --slate-500: #0ea5e9;
-    --slate-600: #0284c7;
-    --slate-700: #0369a1;
-    --slate-800: #075985;
-    --slate-900: #0c4a6e;
+        async function runSenpaiScan() {
+            const count = document.getElementById('scanCount').value;
+            const outputLimit = document.getElementById('outputLimit').value;
+            const resultBox = document.getElementById('scanResult');
+            
+            resultBox.innerHTML = 'در حال اسکن و تست سلامت IPها... لطفاً صبر کنید.';
+            
+            try {
+                const res = await fetch('./api/utils/scan', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ count: parseInt(count), outputLimit: parseInt(outputLimit) })
+                });
+                const data = await res.json();
+                if (data.success && data.data) {
+                    let html = `<b class="text-success">تعداد ${data.count} IP سالم پیدا شد:</b><br><br>`;
+                    data.data.forEach(item => {
+                        html += `<div>IP: <code>${item.ip}</code> | تاخیر: <b>${item.latency}ms</b></div>`;
+                    });
+                    resultBox.innerHTML = html;
+                } else {
+                    resultBox.innerHTML = 'اسکن نتیجه‌ای نداشت یا با خطا مواجه شد.';
+                }
+            } catch (e) {
+                resultBox.innerHTML = 'خطا در ارتباط با سرور برای اسکن IP.';
+            }
+        }
+    </script>
+</body>
+</html>   --slate-900: #0c4a6e;
 }
 html[data-theme="ocean"].dark {
     --color-primary: #38bdf8;
