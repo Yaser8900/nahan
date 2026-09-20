@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "3.0.1";
+const CURRENT_VERSION = "3.0.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -94,6 +94,83 @@ let sysConfigCacheTime = 0;
 let sysUsageCacheTime = 0;
 let backupIpCache = null;
 let backupIpCacheTime = 0;
+
+// ==========================================
+// توابع قابلیت‌های جدید (SenPai, NiREvil, UUID)
+// ==========================================
+
+function handleUuidGeneration() {
+    const newUuid = crypto.randomUUID();
+    return new Response(JSON.stringify({ success: true, uuid: newUuid }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+}
+
+async function checkProxyIpHealth(proxyString) {
+    if (!proxyString) return [];
+    let pips = proxyString.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+    let healthyPips = [];
+    
+    for (let pip of pips) {
+        let [host, portStr] = pip.split(":");
+        let port = portStr ? parseInt(portStr) : 443;
+        try {
+            const socket = connect({ hostname: host, port: port });
+            await socket.opened;
+            healthyPips.push(pip);
+            socket.close().catch(() => {});
+        } catch (e) {
+            // پروکسی ناسالم فیلتر می‌شود
+        }
+    }
+    return healthyPips;
+}
+
+async function handleSenpaiIpScan(request) {
+    try {
+        const body = await request.json();
+        let count = parseInt(body.count) || 500; // پیش‌فرض 500 (100 / 500 / 5000)
+        let rawIps = body.ips || sysConfig.cleanIps || "";
+        let ipList = rawIps.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+        
+        if (ipList.length === 0) {
+            ipList = ["1.1.1.1", "8.8.8.8", "cloudflare.com"];
+        }
+
+        let results = [];
+        let batchSize = Math.min(ipList.length, 10000); // سقف Batch‌بندی 10,000 تست در هر مرحله
+        let targetBatch = ipList.slice(0, batchSize);
+
+        for (let ipEntry of targetBatch) {
+            let [ip, portStr] = ipEntry.split(":");
+            let ports = portStr ? [parseInt(portStr)] : [443, 80, 2053]; // تست چندپورت
+            
+            for (let port of ports) {
+                let startTime = Date.now();
+                try {
+                    const socket = connect({ hostname: ip, port: port });
+                    await socket.opened;
+                    let latency = Date.now() - startTime;
+                    results.push({ ip: `${ip}:${port}`, latency, status: "healthy" });
+                    socket.close().catch(() => {});
+                    break;
+                } catch (e) {
+                    // ناموفق
+                }
+            }
+        }
+
+        results.sort((a, b) => a.latency - b.latency);
+        let limitOutput = parseInt(body.outputLimit) || 100; // پیش‌فرض Top 100 (خروجی 50 / 100 / 200)
+        let topCleanIps = results.slice(0, limitOutput);
+
+        return new Response(JSON.stringify({ success: true, count: topCleanIps.length, data: topCleanIps }), {
+            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+    } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+}
 
 async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
     let currentBindings = [];
@@ -467,6 +544,8 @@ export default {
                 stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
                 update: `/${encodeURI(sysConfig.apiRoute)}/api/update`,
                 apiKeys: `/${encodeURI(sysConfig.apiRoute)}/api/keys`,
+                uuidGen: `/${encodeURI(sysConfig.apiRoute)}/api/utils/uuid`,
+                scanIp: `/${encodeURI(sysConfig.apiRoute)}/api/utils/scan`,
             };
 
             const isSyncRoute = reqPath.endsWith("/api/sync");
@@ -478,6 +557,11 @@ export default {
                 reqPath === routes.update || reqPath.endsWith("/api/update");
             const isApiKeysRoute =
                 reqPath === routes.apiKeys || reqPath.endsWith("/api/keys");
+            const isUuidGenRoute =
+                reqPath === routes.uuidGen || reqPath.endsWith("/api/utils/uuid");
+            const isScanIpRoute =
+                reqPath === routes.scanIp || reqPath.endsWith("/api/utils/scan");
+
             const isAuthorizedRoute =
                 reqPath === routes.data ||
                 reqPath === routes.dash ||
@@ -490,13 +574,23 @@ export default {
                 isUsersRoute ||
                 isStatsRoute ||
                 isUpdateRoute ||
-                isApiKeysRoute;
+                isApiKeysRoute ||
+                isUuidGenRoute ||
+                isScanIpRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
             }
 
             if (!isTelemetryStream) {
+                if (reqPath === routes.uuidGen || isUuidGenRoute) {
+                    if (request.method !== "GET" && request.method !== "POST") return new Response("405", { status: 405 });
+                    return handleUuidGeneration();
+                }
+                if (reqPath === routes.scanIp || isScanIpRoute) {
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleSenpaiIpScan(request);
+                }
                 if (reqPath === routes.dash) {
                     const dashboardUrl = env.DASHBOARD_URL || 'https://raw.githubusercontent.com/itsyebekhe/nahan/main/dashboard.html';
                     try {
@@ -639,7 +733,6 @@ export default {
                             try {
                                 const resp = await fetch(subscriptionUrl);
                                 let html = await resp.text();
-                                // Compute dynamic values
                                 const idClean = targetUser.id.replace(/-/g, '').toLowerCase();
                                 const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
                                 const totalReqs = sysU.reqs || 0;
@@ -676,21 +769,18 @@ export default {
                                 cleanUrl.searchParams.delete('type'); cleanUrl.searchParams.delete('output'); cleanUrl.searchParams.delete('raw');
                                 const syncNormal = cleanUrl.href;
                                 const syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
-                                // Total progress bar
                                 let totalProgress = '';
                                 if (limitTotal) {
                                     totalProgress = `<div class="w-full rounded-full h-1.5 mt-3 overflow-hidden progress-bar-bg"><div class="h-1.5 rounded-full" style="background: var(--accent); width: ${totalPercent}%;"></div></div><p class="text-[10px] text-muted text-right mt-1.5" data-i18n="used">${totalPercent}% Used</p>`;
                                 } else {
                                     totalProgress = '<p class="text-[10px] text-muted mt-2" data-i18n="unlimitedPlan">Unlimited Plan</p>';
                                 }
-                                // Daily progress bar
                                 let dailyProgress = '';
                                 if (limitDaily) {
                                     dailyProgress = `<div class="w-full rounded-full h-1.5 mt-3 overflow-hidden progress-bar-bg"><div class="h-1.5 rounded-full" style="background: var(--amber-text); width: ${dailyPercent}%;"></div></div><p class="text-[10px] text-muted text-right mt-1.5" data-i18n="used">${dailyPercent}% Used</p>`;
                                 } else {
                                     dailyProgress = '<p class="text-[10px] text-muted mt-2" data-i18n="noDailyLimit">No Daily Limit</p>';
                                 }
-                                // Replace placeholders
                                 html = html.replace(/__USER_NAME__/g, targetUser.name);
                                 html = html.replace(/__USER_ID__/g, targetUser.id);
                                 html = html.replace(/__STATUS_CODE__/g, statusCode);
@@ -781,13 +871,11 @@ export default {
                         );
                     }
 
-                    // Determine subscription format
                     let isClashYaml = false;
                     let isSingboxJson = false;
                     let isClashJson = false;
                     let isVJson = false;
 
-                    // If flag is explicitly set, we respect it
                     if (
                         flag === "clash" ||
                         flag === "yaml" ||
@@ -812,9 +900,7 @@ export default {
                     } else if (flag === "vjson" || flag === "v") {
                         isVJson = true;
                     } else if (flag === "base64") {
-                        // Skip auto-detect to default to base64 plain-text subscription format
                     } else if (flag === "a" || flag === "raw" || flag === "") {
-                        // Safe auto-detect for raw sync or no-flag links using target browser / client User-Agent
                         if (
                             ua.includes(getGamma()) ||
                             ua.includes("meta") ||
@@ -1236,7 +1322,6 @@ async function sendTelegramMessage(request, type, hostName) {
         botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
     const isPaused = sysConfig.isPaused || false;
     const panelUrl = `https://${h}/${encodeURI(sysConfig.apiRoute)}/dash`;
-    const subUrl = `https://${h}/${sysConfig.apiRoute}`;
     const inline_keyboard = [
         [
             { text: `📊 ${locT("dashboard")}`, callback_data: "sys_dashboard" },
@@ -1768,10 +1853,9 @@ async function handleStatsApi(request, env) {
                 lastDay: "",
             };
             totalTrafficReqs += sysU.reqs || 0;
-            if (sysU.lastDay === todayDate) dailyTrafficReqs += sysU.dReqs || 0;
+            if (sysU.lastDay === todayDate) dailyTrafficReqs += sysU.dRegs || 0;
         });
 
-        
         let usageData = {};
         for (let [k, v] of uuidUsage.entries()) {
             usageData[k] = { ...v, connects: activeConns.get(k) || 0 };
@@ -1796,7 +1880,7 @@ async function handleStatsApi(request, env) {
                         dailyGB: (dailyTrafficReqs / 6000).toFixed(2),
                     },
                     usage: usageData,
-                system: {
+                    system: {
                         uptimeSeconds: upSeconds,
                         activeConnections,
                         version: CURRENT_VERSION,
@@ -1813,8 +1897,6 @@ async function handleStatsApi(request, env) {
         );
     }
 }
-
-
 
 function cmpVersions(a, b) {
     const strip = (v) => String(v).replace(/^v/, "").trim();
@@ -2014,7 +2096,6 @@ async function handleUpdateApi(request, env, ctx) {
                     ).catch(() => {}),
                 );
 
-                // Update all nodes with main panel update!
                 if (sysConfig.linkedPanels && Array.isArray(sysConfig.linkedPanels)) {
                     for (const p of sysConfig.linkedPanels) {
                         if (p && p.url && p.apiKey) {
@@ -2043,9 +2124,7 @@ async function handleUpdateApi(request, env, ctx) {
                                         logActivity(env, "Node Update Failed", `Node ${p.url} update failed: ${e.message}`);
                                     })
                                 );
-                            } catch (err) {
-                                console.error(`Failed to trigger update on node ${p.url}:`, err);
-                            }
+                            } catch (err) {}
                         }
                     }
                 }
@@ -2258,7 +2337,6 @@ async function handleAuth(request, hostName, ctx, env) {
                     ),
                 );
 
-            // Store login signal for Telegram bot
             if (sysConfig.tgAdminId && env.IOT_DB) {
                 const loginSignal = {
                     name: sysConfig.name || hostName,
@@ -2277,7 +2355,6 @@ async function handleAuth(request, hostName, ctx, env) {
                 );
             }
 
-            // Notify hub panel if configured
             if (
                 sysConfig.hubPanelUrl &&
                 sysConfig.hubPanelUrl.trim() &&
@@ -2503,7 +2580,6 @@ async function handleConfigSync(request, env, ctx) {
                 "customPanelUrl"
             ].forEach((k) => delete slaveConfig[k]);
 
-            // Propagate config to slaveNodes
             if (nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
                 let nodes = nextConfig.slaveNodes
                     .split(/[\r\n,;]+/)
@@ -2530,7 +2606,6 @@ async function handleConfigSync(request, env, ctx) {
                 });
             }
 
-            // Propagate config to linkedPanels
             if (nextConfig.linkedPanels && Array.isArray(nextConfig.linkedPanels)) {
                 nextConfig.linkedPanels.forEach((p) => {
                     if (p && p.url && p.apiKey) {
@@ -2556,9 +2631,7 @@ async function handleConfigSync(request, env, ctx) {
                                     ).catch(() => {}),
                                 );
                             }
-                        } catch (err) {
-                            console.error(`Failed to propagate config to linked panel ${p.url}:`, err);
-                        }
+                        } catch (err) {}
                     }
                 });
             }
@@ -2608,7 +2681,6 @@ async function handleSyncPanel(request, env, ctx) {
                 { status: 400 },
             );
         }
-        // Verify the tgAdminId matches this panel's config
         const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
         if (!adminId || adminId.toString() !== data.tgAdminId.toString()) {
             return new Response(
@@ -2616,7 +2688,6 @@ async function handleSyncPanel(request, env, ctx) {
                 { status: 401 },
             );
         }
-        // Also verify a valid panelApiKey if one was provided
         if (data.panelApiKey && !isPanelApiKey(data.panelApiKey)) {
             return new Response(
                 JSON.stringify({ success: false, error: "Unauthorized" }),
@@ -2647,8 +2718,7 @@ async function handleSyncPanel(request, env, ctx) {
 
 const botI18n = {
     en: {
-        welcome:
-            "🤖 **Welcome to Nahan Gateway Bot**\nSelect your option below to manage your system:",
+        welcome: "🤖 **Welcome to Nahan Gateway Bot**\nSelect your option below to manage your system:",
         status: "System Status",
         users: "Subscribers",
         metrics: "Gateway Health",
@@ -2681,17 +2751,8 @@ const botI18n = {
         msg_enter_name: "Please send a name for the subscriber:",
         msg_added: "Sub added successfully! 🎉",
         msg_deleted: "Sub deleted successfully! 🗑️",
-        msg_panic:
-            "🚨 PANIC MODE ACTIVATED 🚨\nRoute randomized & System Paused.",
+        msg_panic: "🚨 PANIC MODE ACTIVATED 🚨\nRoute randomized & System Paused.",
         msg_invalid: "Invalid input. Please try again.",
-        msg_enter_limits:
-            "Enter limits format:\n`[totalReqs] [dailyReqs] [days_limit]`\n(Use 0 for unlimited)\n\nExample:\n`10000 500 30`",
-        msg_confirm_del: "⚠️ Are you sure you want to delete this subscriber?",
-        msg_confirm_panic:
-            "⚠️ Are you absolutely sure you want to trigger PANIC mode? This will randomize API routes and pause all connections!",
-        status_updated: "Status updated!",
-        access_denied:
-            "Access Denied. You are not authorized to manage this panel.",
         dashboard: "Dashboard",
         search: "Search User",
         statistics: "Statistics",
@@ -2701,15 +2762,6 @@ const botI18n = {
         extend_expiry: "Extend Expiry",
         notes: "Notes",
         device_limit: "Config Limit",
-        msg_enter_search:
-            "🔍 Send a username, UUID, or subscription to search:",
-        msg_enter_notes: "📝 Send notes for this user:",
-        msg_enter_extend_days: "📅 Enter number of days to extend expiration:",
-        msg_traffic_reset: "Traffic has been reset successfully!",
-        msg_expiry_extended: "Expiration extended by {days} days!",
-        msg_no_disabled: "No disabled users found.",
-        msg_enter_device_limit: "Enter config limit (0 for unlimited):",
-        config_limit_updated: "Config limit updated!",
         stats_title: "Panel Statistics",
         count_active: "active",
         count_paused: "paused",
@@ -2728,15 +2780,7 @@ const botI18n = {
         lbl_user_not_found: "⚠️ User not found",
         lbl_none: "None",
         lbl_page: "Page",
-        select_panel: "🔌 Which panel do you want to manage?",
         current_panel: "Current Panel",
-        switch_panel: "🔄 Switch Panel",
-        panel_local: "🏠 This Panel",
-        panel_remote: "🌐",
-        msg_panel_selected: "Panel selected! ✅",
-        msg_panel_error: "❌ Failed to connect to the selected panel.",
-        msg_panel_unreachable:
-            "⚠️ Panel is unreachable. Please check the configuration.",
         btn_sub_link: "Subscription Link",
         sub_link_sent: "Subscription link sent!",
         btn_update_usage: "Update Usage",
@@ -2745,8 +2789,6 @@ const botI18n = {
         tg_logs: "Logs",
         tg_sys_settings: "System Settings",
         tg_adv_settings: "Advanced Settings",
-        tg_logs_view: "View Logs",
-        tg_logs_clear: "Clear Logs",
         tg_proto: "Protocol",
         tg_ports: "Ports",
         tg_uuid: "Device UUID",
@@ -2766,11 +2808,6 @@ const botI18n = {
         tg_nodes: "Nodes",
         tg_strategy: "Name Strategy",
         tg_prefix: "Name Prefix",
-        tg_fake_entries: "Fake Entries",
-        tg_cf_settings: "Cloudflare Settings",
-        tg_tg_settings: "Telegram Settings",
-        tg_backup: "Backup",
-        tg_restore: "Restore",
         tg_current_val: "Current Value",
         tg_new_val: "Send new value:",
         tg_saved: "Saved!",
@@ -2795,8 +2832,7 @@ const botI18n = {
         tg_cf_usage: "CF Usage",
     },
     fa: {
-        welcome:
-            "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
+        welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
         status: "وضعیت سیستم",
         users: "مدیریت مشترکین",
         metrics: "سلامت درگاه شبکه",
@@ -2831,13 +2867,6 @@ const botI18n = {
         msg_deleted: "مشترک با موفقیت حذف گردید!",
         msg_panic: "وضعیت اضطراری فعال شد\nمسیر تصادفی شد و سیستم متوقف گردید.",
         msg_invalid: "ورودی نامعتبر است. مجدداً تلاش نمایید.",
-        msg_enter_limits:
-            "فرمت ورودی محدودیت:\n`[کل] [روزانه] [مدت_روز]`\n(از 0 برای نامحدود استفاده کنید)\n\nمثال:\n`10000 500 30`",
-        msg_confirm_del: "آیا از حذف این مشترک اطمینان کامل دارید؟",
-        msg_confirm_panic:
-            "آیا از فعال‌سازی وضعیت اضطراری اطمینان دارید؟ کل اتصالات متوقف و آدرس‌ها منقضی خواهند شد!",
-        status_updated: "وضعیت بروزرسانی شد!",
-        access_denied: "دسترسی غیرمجاز. شما اجازه مدیریت این پنل را ندارید.",
         dashboard: "داشبورد",
         search: "جستجوی کاربر",
         statistics: "آمار",
@@ -2847,15 +2876,6 @@ const botI18n = {
         extend_expiry: "تمدید انقضا",
         notes: "یادداشت‌ها",
         device_limit: "محدودیت کانفیگ",
-        msg_enter_search: "🔍 نام کاربری، UUID یا لینک اشتراک را ارسال کنید:",
-        msg_enter_notes: "📝 یادداشت برای این کاربر را ارسال کنید:",
-        msg_enter_extend_days: "📅 تعداد روزهای تمدید را وارد کنید:",
-        msg_traffic_reset: "ترافیک با موفقیت بازنشانی شد!",
-        msg_expiry_extended: "انقضا به مدت {days} روز تمدید شد!",
-        msg_no_disabled: "هیچ کاربر غیرفعالی یافت نشد.",
-        msg_enter_device_limit:
-            "محدودیت تعداد کانفیگ را وارد کنید (0 برای نامحدود):",
-        config_limit_updated: "محدودیت کانفیگ به‌روزرسانی شد!",
         stats_title: "آمار پنل",
         count_active: "فعال",
         count_paused: "متوقف",
@@ -2874,15 +2894,7 @@ const botI18n = {
         lbl_user_not_found: "⚠️ کاربر یافت نشد",
         lbl_none: "ندارد",
         lbl_page: "صفحه",
-        select_panel: "🔌 کدام پنل را می‌خواهید مدیریت کنید؟",
         current_panel: "پنل فعلی",
-        switch_panel: "🔄 تغییر پنل",
-        panel_local: "🏠 این پنل",
-        panel_remote: "🌐",
-        msg_panel_selected: "پنل انتخاب شد! ✅",
-        msg_panel_error: "❌ اتصال به پنل انتخابی ناموفق بود.",
-        msg_panel_unreachable:
-            "⚠️ پنل در دسترس نیست. لطفاً پیکربندی را بررسی کنید.",
         btn_sub_link: "لینک اشتراک",
         sub_link_sent: "لینک اشتراک ارسال شد!",
         btn_update_usage: "بروزرسانی مصرف",
@@ -2891,8 +2903,6 @@ const botI18n = {
         tg_logs: "گزارش‌ها",
         tg_sys_settings: "تنظیمات سیستم",
         tg_adv_settings: "تنظیمات پیشرفته",
-        tg_logs_view: "مشاهده گزارش‌ها",
-        tg_logs_clear: "پاک کردن گزارش‌ها",
         tg_proto: "پروتکل",
         tg_ports: "پورت‌ها",
         tg_uuid: "شناسه دستگاه",
@@ -2912,11 +2922,6 @@ const botI18n = {
         tg_nodes: "نودها",
         tg_strategy: "روش نام‌گذاری",
         tg_prefix: "پیشوند",
-        tg_fake_entries: "ورودی‌های اشتراک",
-        tg_cf_settings: "تنظیمات کلودفلر",
-        tg_tg_settings: "تنظیمات تلگرام",
-        tg_backup: "پشتیبان‌گیری",
-        tg_restore: "بازیابی",
         tg_current_val: "مقدار فعلی",
         tg_new_val: "مقدار جدید را ارسال کنید:",
         tg_saved: "ذخیره شد!",
@@ -2993,26 +2998,12 @@ async function fetchRemotePanelUsers(panel) {
     );
 }
 
-async function fetchRemotePanelUser(panel, userId) {
-    return await remotePanelFetch(
-        panel,
-        "GET",
-        `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.apiKey)}`,
-    );
-}
-
 async function fetchRemotePanelStats(panel) {
     return await remotePanelFetch(
         panel,
         "GET",
         `/api/stats?key=${encodeURIComponent(panel.apiKey)}`,
     );
-}
-
-async function fetchRemotePanelConfig(panel) {
-    return await remotePanelFetch(panel, "POST", "/api/auth", {
-        key: panel.apiKey,
-    });
 }
 
 async function remotePanelWriteAction(panel, method, userId, body = null) {
@@ -3090,8 +3081,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         } catch (e) {}
 
         const panels = getPanelsList();
-
-        // Read last login signal from D1 (set by handleAuth or handleSyncPanel)
         let lastLoginPanel = null;
         try {
             const stored = await d1Get(env, "tg_panel_login");
@@ -3106,7 +3095,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     (p) => !p.isLocal && p.host === lastLoginPanel.host,
                 );
                 if (found) return found;
-                // Remote panel not in linkedPanels — synthesize from login signal
                 return {
                     name: lastLoginPanel.name || lastLoginPanel.host,
                     host: lastLoginPanel.host,
@@ -3118,10 +3106,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     isLocal: false,
                 };
             }
-            return panels[0]; // default to local
+            return panels[0];
         };
 
-        // Custom sendOrEdit message helper
         const sendOrEdit = async (
             chatId,
             text,
@@ -3195,7 +3182,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const panelUrl = isLocal
                 ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`
                 : null;
-            const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
             /** @type {any} */
             const inline_keyboard = [];
             if (isAdmin) {
@@ -3264,14 +3250,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         callback_data: "sys_panel_info",
                     },
                 ]);
-                if (isAdmin) {
-                    inline_keyboard.push([
-                        {
-                            text: `🚨 ${t("panic")}`,
-                            callback_data: "sys_panic_init",
-                        },
-                    ]);
-                }
             } else {
                 inline_keyboard.push([
                     {
@@ -3399,29 +3377,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                   ? t("dash_expired")
                   : t("active");
             const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
-            const maxCfgTxt = u.maxConfigs || t("unlimited");
-            const notesTxt = u.notes || t("lbl_none");
-            const modeTxt = u.userMode
-                ? u.userMode === "alpha"
-                    ? "Alpha (V)"
-                    : u.userMode === "beta"
-                      ? "Beta (T)"
-                      : "Both"
-                : t("unlimited");
-            const portsTxt = u.userPorts || t("unlimited");
-            const cleanIpsTxt = u.cleanIp
-                ? u.cleanIp.substring(0, 30) +
-                  (u.cleanIp.length > 30 ? "..." : "")
-                : "—";
-            const proxyIpsTxt = u.proxyIp
-                ? u.proxyIp.substring(0, 30) +
-                  (u.proxyIp.length > 30 ? "..." : "")
-                : "—";
-            const nodesTxt = u.userNodes
-                ? u.userNodes.substring(0, 30) +
-                  (u.userNodes.length > 30 ? "..." : "")
-                : "—";
-            const nat64Txt = u.nat64 || "—";
 
             let text = `👤 **${t("sub_info")}**\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
@@ -3431,17 +3386,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             text += `📊 **${t("total")}**: ${usedGB} GB / ${limitGB} GB (${userReqs} reqs)\n`;
             text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
             text += `📅 **${t("expiry")}**: ${expTxt}\n`;
-            text += `⏳ **${t("days")}**: ${daysLeft}\n`;
-            text += `📡 **${t("tg_u_mode")}**: ${modeTxt}\n`;
-            text += `🔌 **${t("tg_u_ports")}**: ${portsTxt}\n`;
-            text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
-            text += `🧹 **${t("tg_u_clean_ips")}**: ${cleanIpsTxt}\n`;
-            text += `🔗 **${t("tg_u_proxy_ips")}**: ${proxyIpsTxt}\n`;
-            text += `🖥️ **${t("tg_u_nodes")}**: ${nodesTxt}\n`;
-            text += `🌐 **${t("tg_u_nat64")}**: ${nat64Txt}\n`;
-            text += `🔗 **${t("tg_u_conn_limit")}**: ${u.connLimit || t("unlimited")}\n`;
-            text += `🎛 **${t("tg_u_panel_url")}**: ${u.userPanelUrl || t("unlimited")}\n`;
-            text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `🔗 **${t("lbl_subscription")}:**\n\`${subSync}\``;
 
@@ -3457,36 +3401,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         {
                             text: `🗑️ ${t("btn_del")}`,
                             callback_data: `sub_del_init:${u.id}`,
-                        },
-                    ],
-                    [
-                        {
-                            text: `✏️ ${t("btn_edit_name")}`,
-                            callback_data: `sub_edit_name_init:${u.id}`,
-                        },
-                        {
-                            text: `⚙️ ${t("btn_edit_limits")}`,
-                            callback_data: `sub_edit_limits_init:${u.id}`,
-                        },
-                    ],
-                    [
-                        {
-                            text: `🔄 ${t("reset_traffic")}`,
-                            callback_data: `sub_reset_traffic:${u.id}`,
-                        },
-                        {
-                            text: `📅 ${t("extend_expiry")}`,
-                            callback_data: `sub_extend_init:${u.id}`,
-                        },
-                    ],
-                    [
-                        {
-                            text: `📝 ${t("notes")}`,
-                            callback_data: `sub_edit_notes_init:${u.id}`,
-                        },
-                        {
-                            text: `📱 ${t("device_limit")}`,
-                            callback_data: `sub_edit_device_init:${u.id}`,
                         },
                     ],
                     [
@@ -3520,11 +3434,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     return new Response("OK", { status: 200 });
                 }
 
-                // Get active panel from last login signal
                 const activePanel = getActivePanel();
                 const isRemotePanel = activePanel && !activePanel.isLocal;
 
-                // Helper to fetch users for the active panel
                 const getPanelUsers = async () => {
                     if (isRemotePanel) {
                         const res = await fetchRemotePanelUsers(activePanel);
@@ -3533,7 +3445,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     return sysConfig.users || [];
                 };
 
-                // Clear step state on callback query
                 tgState[chatId] = null;
                 ctx?.waitUntil(
                     d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(
@@ -3564,83 +3475,16 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     );
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "sys_metrics") {
-                    let usageStr = t("unlimited");
-                    if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
-                        const reqs = await fetchCloudflareUsage(
-                            sysConfig.cfAccountId,
-                            sysConfig.cfApiToken,
-                        );
-                        if (reqs !== null) {
-                            const pct = ((reqs / 100000) * 100).toFixed(2);
-                            usageStr = `${reqs}/100000 (${pct}%)`;
-                        }
-                    }
-                    const upSeconds = Math.floor(
-                        (Date.now() - isolateStartTime) / 1000,
-                    );
-                    const dh = Math.floor(upSeconds / 3600);
-                    const dm = Math.floor((upSeconds % 3600) / 60);
-
-                    let text = `📡 **${t("metrics")}**\n`;
-                    text += `━━━━━━━━━━━━━━━━\n`;
-                    text += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
-                    text += `🔌 **${t("streams")}**: ${activeConnections}\n`;
-                    text += `📊 **Cloudflare API Usage**: ${usageStr}\n`;
-                    text += `━━━━━━━━━━━━━━━━`;
-
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("subs_list:")) {
                     const page = parseInt(data.replace("subs_list:", "")) || 0;
                     const panelUsers = await getPanelUsers();
-                    if (panelUsers === null && isRemotePanel) {
-                        await sendOrEdit(chatId, t("msg_panel_error"), {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: t("btn_main_menu"),
-                                        callback_data: "main_menu",
-                                    },
-                                ],
-                            ],
-                        });
-                    } else {
-                        const list = getSubsList(page, panelUsers);
-                        await sendOrEdit(chatId, list.text, list.kb, messageId);
-                    }
+                    const list = getSubsList(page, panelUsers);
+                    await sendOrEdit(chatId, list.text, list.kb, messageId);
                 } else if (data.startsWith("sub_detail:")) {
                     const uuid = data.replace("sub_detail:", "");
                     const panelUsers = await getPanelUsers();
-                    if (panelUsers === null && isRemotePanel) {
-                        await sendOrEdit(chatId, t("msg_panel_error"), {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: t("btn_main_menu"),
-                                        callback_data: "main_menu",
-                                    },
-                                ],
-                            ],
-                        });
-                    } else {
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(
-                            chatId,
-                            detail.text,
-                            detail.kb,
-                            messageId,
-                        );
-                    }
+                    const detail = getSubDetail(uuid, panelUsers);
+                    await sendOrEdit(chatId, detail.text, detail.kb, messageId);
                 } else if (data.startsWith("sub_toggle:")) {
                     const uuid = data.replace("sub_toggle:", "");
                     if (isRemotePanel) {
@@ -3661,683 +3505,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const panelUsers = await getPanelUsers();
                     const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, detail.text, detail.kb, messageId);
-                } else if (data.startsWith("sub_del_init:")) {
-                    const uuid = data.replace("sub_del_init:", "");
-                    const panelUsers = await getPanelUsers();
-                    const u = panelUsers?.find((usr) => usr.id === uuid);
-                    const name = u ? u.name : "";
-                    const text = `${t("msg_confirm_del")}\n\n👤 **${name}**`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `✅ ${t("btn_confirm")}`,
-                                    callback_data: `sub_del_confirm:${uuid}`,
-                                },
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: `sub_detail:${uuid}`,
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_del_confirm:")) {
-                    const uuid = data.replace("sub_del_confirm:", "");
-                    if (isRemotePanel) {
-                        await remotePanelWriteAction(
-                            activePanel,
-                            "DELETE",
-                            uuid,
-                        );
-                    } else if (sysConfig.users) {
-                        sysConfig.users = sysConfig.users.filter(
-                            (usr) => usr.id !== uuid,
-                        );
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                    }
-                    const successText = `✅ ${t("msg_deleted")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: t("btn_back"),
-                                    callback_data: "subs_list:0",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, successText, kb, messageId);
-                } else if (data === "sub_add_init") {
-                    tgState[chatId] = { step: "sub_add_name" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `➕ ${t("msg_enter_name")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: "subs_list:0",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_name_init:")) {
-                    const uuid = data.replace("sub_edit_name_init:", "");
-                    tgState[chatId] = { step: `sub_edit_name:${uuid}` };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `✏️ ${t("msg_enter_name")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: `sub_detail:${uuid}`,
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_limits_init:")) {
-                    const uuid = data.replace("sub_edit_limits_init:", "");
-                    tgState[chatId] = { step: `sub_edit_limits:${uuid}` };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `⚙️ ${t("msg_enter_limits")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `♾️ Skip (Unlimited)`,
-                                    callback_data: `sub_unlimit_cb:${uuid}`,
-                                },
-                            ],
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: `sub_detail:${uuid}`,
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_unlimit_cb:")) {
-                    const uuid = data.replace("sub_unlimit_cb:", "");
-                    if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, "PUT", uuid, {
-                            key: activePanel.apiKey,
-                            trafficLimit: 0,
-                            dailyLimit: 0,
-                            expiryDays: 0,
-                        });
-                    } else if (sysConfig.users) {
-                        const u = sysConfig.users.find(
-                            (usr) => usr.id === uuid,
-                        );
-                        if (u) {
-                            u.limitTotalReq = null;
-                            u.limitDailyReq = null;
-                            u.expiryMs = null;
-                            await cachedD1Put(
-                                env,
-                                "sys_config",
-                                JSON.stringify(sysConfig),
-                            );
-                        }
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(chatId, detail.text, detail.kb, messageId);
-                } else if (data === "sub_add_unlimited_skip") {
-                    let stateName = "Subscriber";
-                    try {
-                        const savedStateRaw = await d1Get(env, "tg_bot_state");
-                        if (savedStateRaw) {
-                            const stObj = JSON.parse(savedStateRaw);
-                            if (stObj[chatId] && stObj[chatId].name) {
-                                stateName = stObj[chatId].name;
-                            }
-                        }
-                    } catch (e) {}
-
-                    const newUuid = crypto.randomUUID();
-                    if (isRemotePanel) {
-                        const res = await remotePanelWriteAction(
-                            activePanel,
-                            "POST",
-                            null,
-                            { key: activePanel.apiKey, name: stateName },
-                        );
-                        if (res.success && res.user) {
-                            const detail = getSubDetail(res.user.id, [
-                                res.user,
-                            ]);
-                            await sendOrEdit(
-                                chatId,
-                                `✅ ${t("msg_added")}\n\n${detail.text}`,
-                                detail.kb,
-                                messageId,
-                            );
-                        } else {
-                            await sendOrEdit(chatId, t("msg_panel_error"), {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: t("btn_main_menu"),
-                                            callback_data: "main_menu",
-                                        },
-                                    ],
-                                ],
-                            });
-                        }
-                    } else {
-                        if (!sysConfig.users) sysConfig.users = [];
-                        sysConfig.users.push({
-                            id: newUuid,
-                            name: stateName,
-                            limitTotalReq: null,
-                            limitDailyReq: null,
-                            expiryMs: null,
-                            createdAt: Date.now(),
-                        });
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        const detail = getSubDetail(newUuid);
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("msg_added")}\n\n${detail.text}`,
-                            detail.kb,
-                            messageId,
-                        );
-                    }
-                    tgState[chatId] = null;
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                } else if (data === "sys_panic_init") {
-                    const text = `${t("msg_confirm_panic")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `🚨 YES PANIC 🚨`,
-                                    callback_data: "sys_panic_confirm",
-                                },
-                                {
-                                    text: `❌ No, Cancel`,
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "sys_panic_confirm") {
-                    sysConfig.apiRoute = Array.from(
-                        crypto.getRandomValues(new Uint8Array(8)),
-                    )
-                        .map((b) => b.toString(16).padStart(2, "0"))
-                        .join("");
-                    sysConfig.isPaused = true;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, successText, kb, messageId);
-                } else if (data === "sys_dashboard") {
-                    let users,
-                        activeCount,
-                        pausedCount,
-                        expiredCount,
-                        autoDisabledCount;
-                    if (isRemotePanel) {
-                        const statsRes =
-                            await fetchRemotePanelStats(activePanel);
-                        if (statsRes.success && statsRes.stats) {
-                            const s = statsRes.stats;
-                            users = [];
-                            activeCount = s.users?.active || 0;
-                            pausedCount = s.users?.paused || 0;
-                            expiredCount = s.users?.expired || 0;
-                            autoDisabledCount = s.users?.autoDisabled || 0;
-                        } else {
-                            const panelUsers = await getPanelUsers();
-                            users = panelUsers || [];
-                            activeCount = users.filter(
-                                (u) =>
-                                    !u.isPaused &&
-                                    (!u.expiryMs || Date.now() <= u.expiryMs),
-                            ).length;
-                            pausedCount = users.filter(
-                                (u) => u.isPaused && !u.disabledReason,
-                            ).length;
-                            expiredCount = users.filter(
-                                (u) =>
-                                    u.expiryMs &&
-                                    Date.now() > u.expiryMs &&
-                                    !u.isPaused,
-                            ).length;
-                            autoDisabledCount = users.filter(
-                                (u) => u.isPaused && u.disabledReason,
-                            ).length;
-                        }
-                    } else {
-                        users = sysConfig.users || [];
-                        activeCount = users.filter(
-                            (u) =>
-                                !u.isPaused &&
-                                (!u.expiryMs || Date.now() <= u.expiryMs),
-                        ).length;
-                        pausedCount = users.filter(
-                            (u) => u.isPaused && !u.disabledReason,
-                        ).length;
-                        expiredCount = users.filter(
-                            (u) =>
-                                u.expiryMs &&
-                                Date.now() > u.expiryMs &&
-                                !u.isPaused,
-                        ).length;
-                        autoDisabledCount = users.filter(
-                            (u) => u.isPaused && u.disabledReason,
-                        ).length;
-                    }
-                    let dashText = `📊 **${t("dashboard")}**\n`;
-                    dashText += `━━━━━━━━━━━━━━━━\n`;
-                    dashText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? "🏠" : "🌐"} ${activePanel.name}\n`;
-                    dashText += `━━━━━━━━━━━━━━━━\n`;
-                    dashText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : activeCount + pausedCount + expiredCount + autoDisabledCount}\n`;
-                    dashText += `🟢 **${t("dash_active")}**: ${activeCount}\n`;
-                    dashText += `⏸️ **${t("dash_paused")}**: ${pausedCount}\n`;
-                    dashText += `🔴 **${t("dash_expired")}**: ${expiredCount}\n`;
-                    dashText += `🚫 **${t("dash_auto_disabled")}**: ${autoDisabledCount}\n`;
-                    if (!isRemotePanel) {
-                        const upSeconds = Math.floor(
-                            (Date.now() - isolateStartTime) / 1000,
-                        );
-                        const dh = Math.floor(upSeconds / 3600);
-                        const dm = Math.floor((upSeconds % 3600) / 60);
-                        dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
-                        dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
-                        dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
-                    }
-                    dashText += `━━━━━━━━━━━━━━━━`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, dashText, kb, messageId);
-                } else if (data === "sys_stats") {
-                    let users, totalReqs, dailyReqs;
-                    if (isRemotePanel) {
-                        const statsRes =
-                            await fetchRemotePanelStats(activePanel);
-                        if (statsRes.success && statsRes.stats) {
-                            const s = statsRes.stats;
-                            users = [];
-                            totalReqs = s.traffic?.totalRequests || 0;
-                            dailyReqs = s.traffic?.dailyRequests || 0;
-                        } else {
-                            const panelUsers = await getPanelUsers();
-                            users = panelUsers || [];
-                            totalReqs = 0;
-                            dailyReqs = 0;
-                        }
-                    } else {
-                        users = sysConfig.users || [];
-                        totalReqs = 0;
-                        dailyReqs = 0;
-                        const todayDate = new Date()
-                            .toISOString()
-                            .split("T")[0];
-                        users.forEach((u) => {
-                            const idClean = u.id
-                                .replace(/-/g, "")
-                                .toLowerCase();
-                            const sysU = sysUsageCache?.users?.[idClean] || {
-                                reqs: 0,
-                                dReqs: 0,
-                                lastDay: "",
-                            };
-                            totalReqs += sysU.reqs || 0;
-                            if (sysU.lastDay === todayDate)
-                                dailyReqs += sysU.dReqs || 0;
-                        });
-                    }
-                    let statsText = `📈 **${t("stats_title")}**\n`;
-                    statsText += `━━━━━━━━━━━━━━━━\n`;
-                    statsText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? "🏠" : "🌐"} ${activePanel.name}\n`;
-                    statsText += `━━━━━━━━━━━━━━━━\n`;
-                    statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : "N/A"}\n`;
-                    statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
-                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
-                    if (!isRemotePanel) {
-                        const upSeconds = Math.floor(
-                            (Date.now() - isolateStartTime) / 1000,
-                        );
-                        const dh = Math.floor(upSeconds / 3600);
-                        const dm = Math.floor((upSeconds % 3600) / 60);
-                        statsText += `⏱ **${t("tg_uptime")}**: ${dh}h ${dm}m\n`;
-                        statsText += `🔌 **${t("tg_conns")}**: ${activeConnections}\n`;
-                        statsText += `📦 **${t("tg_version")}**: v${CURRENT_VERSION}\n`;
-                    }
-                    statsText += `━━━━━━━━━━━━━━━━`;
-                    if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
-                        const reqs = await fetchCloudflareUsage(
-                            sysConfig.cfAccountId,
-                            sysConfig.cfApiToken,
-                        );
-                        if (reqs !== null) {
-                            const pct = ((reqs / 100000) * 100).toFixed(2);
-                            statsText += `\n☁️ **Cloudflare API**: ${reqs}/100000 (${pct}%)`;
-                        }
-                    }
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `🔄 ${t("btn_update_usage")}`,
-                                    callback_data: "sys_stats",
-                                },
-                            ],
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, statsText, kb, messageId);
-                } else if (data === "sys_panel_info") {
-                    let infoText = `ℹ️ **${t("panel_info")}**\n`;
-                    infoText += `━━━━━━━━━━━━━━━━\n`;
-                    infoText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? "🏠" : "🌐"} ${activePanel.name}\n`;
-                    if (activePanel.isLocal) {
-                        infoText += `🌐 **Host**: ${hostName}\n`;
-                        infoText += `🔑 **API Route**: \`${sysConfig.apiRoute}\`\n`;
-                        infoText += `📡 **Mode**: ${sysConfig.mode || "alpha"}\n`;
-                        infoText += `🔒 **Ports**: ${sysConfig.socketPorts || "443"}\n`;
-                    } else {
-                        infoText += `🌐 **Host**: ${activePanel.host}\n`;
-                        infoText += `🔑 **API Route**: \`${activePanel.apiRoute}\`\n`;
-                    }
-                    infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
-                    infoText += `━━━━━━━━━━━━━━━━`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, infoText, kb, messageId);
-                } else if (data.startsWith("subs_disabled:")) {
-                    const panelUsers = await getPanelUsers();
-                    const users = panelUsers || [];
-                    const disabledUsers = users.filter((u) => u.isPaused);
-                    if (disabledUsers.length === 0) {
-                        const kb = {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: t("btn_main_menu"),
-                                        callback_data: "main_menu",
-                                    },
-                                ],
-                            ],
-                        };
-                        await sendOrEdit(
-                            chatId,
-                            `🚫 ${t("msg_no_disabled")}`,
-                            kb,
-                            messageId,
-                        );
-                    } else {
-                        const page =
-                            parseInt(data.replace("subs_disabled:", "")) || 0;
-                        const itemsPerPage = 5;
-                        const start = page * itemsPerPage;
-                        const end = start + itemsPerPage;
-                        const pageUsers = disabledUsers.slice(start, end);
-                        let text = `🚫 **${t("disabled_users")}** (${disabledUsers.length})\n━━━━━━━━━━━━━━━━\n`;
-                        const inline_keyboard = [];
-                        pageUsers.forEach((u) => {
-                            const reason = u.disabledReason || t("paused");
-                            text += `👤 **${u.name}**\n   ${reason}\n`;
-                            inline_keyboard.push([
-                                {
-                                    text: `▶️ ${u.name}`,
-                                    callback_data: `sub_toggle:${u.id}`,
-                                },
-                            ]);
-                        });
-                        const navRow = [];
-                        if (page > 0)
-                            navRow.push({
-                                text: `⬅️ ${t("btn_back")}`,
-                                callback_data: `subs_disabled:${page - 1}`,
-                            });
-                        if (end < disabledUsers.length)
-                            navRow.push({
-                                text: `${t("btn_next")} ➡️`,
-                                callback_data: `subs_disabled:${page + 1}`,
-                            });
-                        if (navRow.length > 0) inline_keyboard.push(navRow);
-                        inline_keyboard.push([
-                            {
-                                text: t("btn_main_menu"),
-                                callback_data: "main_menu",
-                            },
-                        ]);
-                        await sendOrEdit(
-                            chatId,
-                            text,
-                            { inline_keyboard },
-                            messageId,
-                        );
-                    }
-                } else if (data === "sub_search_init") {
-                    tgState[chatId] = { step: "sub_search" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `🔍 ${t("msg_enter_search")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_reset_traffic:")) {
-                    const uuid = data.replace("sub_reset_traffic:", "");
-                    if (isRemotePanel) {
-                        await remotePanelResetTraffic(activePanel, uuid);
-                    } else {
-                        if (!sysUsageCache) sysUsageCache = { users: {} };
-                        if (!sysUsageCache.users) sysUsageCache.users = {};
-                        const uuidClean = uuid.replace(/-/g, "").toLowerCase();
-                        if (sysUsageCache.users[uuidClean]) {
-                            sysUsageCache.users[uuidClean].reqs = 0;
-                            sysUsageCache.users[uuidClean].dReqs = 0;
-                        } else {
-                            sysUsageCache.users[uuidClean] = {
-                                reqs: 0,
-                                dReqs: 0,
-                                lastDay: new Date().toISOString().split("T")[0],
-                            };
-                        }
-                        await cachedD1Put(
-                            env,
-                            "sys_usage",
-                            JSON.stringify(sysUsageCache),
-                        );
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(
-                        chatId,
-                        `✅ ${t("msg_traffic_reset")}\n\n${detail.text}`,
-                        detail.kb,
-                        messageId,
-                    );
-                } else if (data.startsWith("sub_extend_init:")) {
-                    const uuid = data.replace("sub_extend_init:", "");
-                    tgState[chatId] = { step: `sub_extend_days:${uuid}` };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `📅 ${t("msg_enter_extend_days")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: `sub_detail:${uuid}`,
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_notes_init:")) {
-                    const uuid = data.replace("sub_edit_notes_init:", "");
-                    tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `📝 ${t("msg_enter_notes")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: `sub_detail:${uuid}`,
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_edit_device_init:")) {
-                    const uuid = data.replace("sub_edit_device_init:", "");
-                    tgState[chatId] = { step: `sub_edit_device:${uuid}` };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const text = `📱 ${t("msg_enter_device_limit")}`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `♾️ Unlimited`,
-                                    callback_data: `sub_device_unlimited:${uuid}`,
-                                },
-                            ],
-                            [
-                                {
-                                    text: `❌ ${t("btn_cancel")}`,
-                                    callback_data: `sub_detail:${uuid}`,
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data.startsWith("sub_device_unlimited:")) {
-                    const uuid = data.replace("sub_device_unlimited:", "");
-                    if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, "PUT", uuid, {
-                            key: activePanel.apiKey,
-                            maxConfigs: null,
-                        });
-                    } else if (sysConfig.users) {
-                        const u = sysConfig.users.find(
-                            (usr) => usr.id === uuid,
-                        );
-                        if (u) {
-                            u.maxConfigs = null;
-                            await cachedD1Put(
-                                env,
-                                "sys_config",
-                                JSON.stringify(sysConfig),
-                            );
-                        }
-                    }
-                    const panelUsers = await getPanelUsers();
-                    const detail = getSubDetail(uuid, panelUsers);
-                    await sendOrEdit(
-                        chatId,
-                        `✅ ${t("status_updated")}`,
-                        detail.kb,
-                        messageId,
-                    );
                 } else if (data === "get_sub_link") {
                     const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
                     await fetch(`${tgApi}/sendMessage`, {
@@ -4350,708 +3517,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }),
                     });
                     answerText = t("sub_link_sent");
-                } else if (data === "tg_settings_menu") {
-                    const modeTxt =
-                        sysConfig.mode === "alpha"
-                            ? "Alpha (V)"
-                            : sysConfig.mode === "beta"
-                              ? "Beta (T)"
-                              : "Both";
-                    const portsTxt = sysConfig.socketPorts || "443";
-                    const passTxt = sysConfig.masterKey || "admin";
-                    const dnsTxt = sysConfig.resolveIp || "1.1.1.1";
-                    const relayTxt = sysConfig.backupRelay || "—";
-                    const tfoTxt = sysConfig.enableOpt1 ? "✅" : "❌";
-                    const echTxt = sysConfig.enableOpt2 ? "✅" : "❌";
-                    const pauseTxt = sysConfig.isPaused ? "🔴 ON" : "🟢 OFF";
-                    const silentTxt = sysConfig.silentAlerts ? "✅" : "❌";
-                    const autoUpTxt = sysConfig.autoUpdate ? "✅" : "❌";
-                    const directTxt = sysConfig.enableDirectConfigs
-                        ? "✅"
-                        : "❌";
-                    const nat64Txt = sysConfig.nat64Prefix || "—";
-                    let text = `⚙️ **${t("tg_sys_settings")}**\n━━━━━━━━━━━━━━━━\n`;
-                    text += `📡 ${t("tg_proto")}: **${modeTxt}**\n`;
-                    text += `🔌 ${t("tg_ports")}: \`${portsTxt}\`\n`;
-                    text += `🔑 ${t("tg_pass")}: \`${passTxt}\`\n`;
-                    text += `🌐 ${t("tg_dns")}: \`${dnsTxt}\`\n`;
-                    text += `🔗 ${t("tg_relay")}: \`${relayTxt}\`\n`;
-                    text += `⚡ ${t("tg_tfo")}: ${tfoTxt} | ECH: ${echTxt}\n`;
-                    text += `🔇 ${t("tg_silent")}: ${silentTxt}\n`;
-                    text += `🛑 ${t("tg_pause")}: ${pauseTxt}\n`;
-                    text += `🔄 ${t("tg_auto_update")}: ${autoUpTxt}\n`;
-                    text += `🔀 ${t("tg_direct")}: ${directTxt}\n`;
-                    text += `🌐 ${t("tg_nat64")}: \`${nat64Txt}\`\n`;
-                    text += `━━━━━━━━━━━━━━━━`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `📡 ${t("tg_proto")}`,
-                                    callback_data: "tg_edit_proto",
-                                },
-                                {
-                                    text: `🔌 ${t("tg_ports")}`,
-                                    callback_data: "tg_edit_ports",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🔑 ${t("tg_pass")}`,
-                                    callback_data: "tg_edit_pass",
-                                },
-                                {
-                                    text: `🌐 ${t("tg_dns")}`,
-                                    callback_data: "tg_edit_dns",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🔗 ${t("tg_relay")}`,
-                                    callback_data: "tg_edit_relay",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `⚡ ${t("tg_tfo")}`,
-                                    callback_data: "tg_toggle_tfo",
-                                },
-                                { text: `ECH`, callback_data: "tg_toggle_ech" },
-                            ],
-                            [
-                                {
-                                    text: `${t("tg_silent")}`,
-                                    callback_data: "tg_toggle_silent",
-                                },
-                                {
-                                    text: `${t("tg_pause")}`,
-                                    callback_data: "tg_toggle_pause2",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🔄 ${t("tg_auto_update")}`,
-                                    callback_data: "tg_toggle_auto_update",
-                                },
-                                {
-                                    text: `🔀 ${t("tg_direct")}`,
-                                    callback_data: "tg_toggle_direct",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🌐 ${t("tg_nat64")}`,
-                                    callback_data: "tg_edit_nat64",
-                                },
-                            ],
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "tg_advanced_menu") {
-                    const cleanTxt = sysConfig.cleanIps
-                        ? sysConfig.cleanIps.substring(0, 40) +
-                          (sysConfig.cleanIps.length > 40 ? "..." : "")
-                        : "—";
-                    const lpUrls = (sysConfig.linkedPanels || []).map(p => p.url).filter(Boolean);
-                    const nodesTxt = lpUrls.length > 0
-                        ? lpUrls.join(", ").substring(0, 40) +
-                          (lpUrls.join(", ").length > 40 ? "..." : "")
-                        : "—";
-                    const strategyTxt = sysConfig.nameStrategy || "default";
-                    const prefixTxt = sysConfig.namePrefix || "Core";
-                    const maintenanceTxt = sysConfig.maintenanceHost
-                        ? sysConfig.maintenanceHost.substring(0, 30) + "..."
-                        : "—";
-                    let text = `🔧 **${t("tg_adv_settings")}**\n━━━━━━━━━━━━━━━━\n`;
-                    text += `🧹 ${t("tg_clean_ips")}: \`${cleanTxt}\`\n`;
-                    text += `🖥️ ${t("tg_nodes")}: \`${nodesTxt}\`\n`;
-                    text += `📝 ${t("tg_strategy")}: \`${strategyTxt}\`\n`;
-                    text += `🏷️ ${t("tg_prefix")}: \`${prefixTxt}\`\n`;
-                    text += `🎭 ${t("tg_maintenance")}: \`${maintenanceTxt}\`\n`;
-                    text += `━━━━━━━━━━━━━━━━`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `🧹 ${t("tg_clean_ips")}`,
-                                    callback_data: "tg_edit_clean_ips",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🖥️ ${t("tg_nodes")}`,
-                                    callback_data: "tg_edit_nodes",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `📝 ${t("tg_strategy")}`,
-                                    callback_data: "tg_edit_strategy",
-                                },
-                                {
-                                    text: `🏷️ ${t("tg_prefix")}`,
-                                    callback_data: "tg_edit_prefix",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🎭 ${t("tg_maintenance")}`,
-                                    callback_data: "tg_edit_maintenance",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `🤖 ${t("tg_tg_settings")}`,
-                                    callback_data: "tg_edit_tg_settings",
-                                },
-                            ],
-                            [
-                                {
-                                    text: `☁️ ${t("tg_cf_settings")}`,
-                                    callback_data: "tg_edit_cf_settings",
-                                },
-                            ],
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "tg_logs_menu") {
-                    let logs = [];
-                    if (env.IOT_DB) {
-                        const stored = await d1Get(env, "sys_logs");
-                        if (stored) logs = JSON.parse(stored);
-                    }
-                    let text = `📋 **${t("tg_logs")}**\n━━━━━━━━━━━━━━━━\n`;
-                    if (logs.length === 0) {
-                        text += `ℹ️ ${t("tg_log_empty")}\n`;
-                    } else {
-                        logs.slice(0, 10).forEach((log, i) => {
-                            const time = new Date(log.ts).toLocaleString();
-                            text += `${i + 1}. ${t("tg_log_entry")} **${log.type}**\n   ${log.detail}\n   📅 ${time}\n`;
-                        });
-                        if (logs.length > 10)
-                            text += `\n... ${logs.length - 10} more entries`;
-                    }
-                    text += `\n━━━━━━━━━━━━━━━━`;
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: `🔄 ${t("btn_update_usage")}`,
-                                    callback_data: "tg_logs_menu",
-                                },
-                            ],
-                            [
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(chatId, text, kb, messageId);
-                } else if (data === "tg_toggle_tfo") {
-                    sysConfig.enableOpt1 = !sysConfig.enableOpt1;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_ech") {
-                    sysConfig.enableOpt2 = !sysConfig.enableOpt2;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_silent") {
-                    sysConfig.silentAlerts = !sysConfig.silentAlerts;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_pause2") {
-                    sysConfig.isPaused = !sysConfig.isPaused;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    answerText = t("tg_saved");
-                    const menu = getMainMenu(getActivePanel(), isAuthorized);
-                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
-                } else if (data === "tg_toggle_auto_update") {
-                    sysConfig.autoUpdate = !sysConfig.autoUpdate;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    answerText = t("tg_saved");
-                    await sendOrEdit(
-                        chatId,
-                        `⚙️ ${t("tg_auto_update")}: ${sysConfig.autoUpdate ? "✅ ON" : "❌ OFF"}`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "◀️ " + t("btn_back"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_toggle_direct") {
-                    sysConfig.enableDirectConfigs =
-                        !sysConfig.enableDirectConfigs;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    answerText = t("tg_saved");
-                    await sendOrEdit(
-                        chatId,
-                        `🔀 ${t("tg_direct")}: ${sysConfig.enableDirectConfigs ? "✅ ON" : "❌ OFF"}`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "◀️ " + t("btn_back"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_proto") {
-                    tgState[chatId] = { step: "tg_edit_proto" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: "Alpha (V-Core)",
-                                    callback_data: "tg_set_proto:alpha",
-                                },
-                                {
-                                    text: "Beta (T-Core)",
-                                    callback_data: "tg_set_proto:beta",
-                                },
-                            ],
-                            [
-                                {
-                                    text: "Both",
-                                    callback_data: "tg_set_proto:both",
-                                },
-                            ],
-                            [
-                                {
-                                    text: "❌ " + t("btn_cancel"),
-                                    callback_data: "tg_settings_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(
-                        chatId,
-                        `📡 **${t("tg_proto")}**\n${t("tg_current_val")}: **${sysConfig.mode}**\n\n${t("tg_new_val")}`,
-                        kb,
-                        messageId,
-                    );
-                } else if (data.startsWith("tg_set_proto:")) {
-                    const val = data.replace("tg_set_proto:", "");
-                    sysConfig.mode = val;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    tgState[chatId] = null;
-                    answerText = t("tg_saved");
-                    await sendOrEdit(
-                        chatId,
-                        `✅ ${t("tg_proto")}: **${val}**`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "◀️ " + t("btn_back"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_dns") {
-                    tgState[chatId] = { step: "tg_edit_dns" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🌐 **${t("tg_dns")}**\n${t("tg_current_val")}: \`${sysConfig.resolveIp}\`\n\n${t("tg_new_val")}`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_relay") {
-                    tgState[chatId] = { step: "tg_edit_relay" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🔗 **${t("tg_relay")}**\n${t("tg_current_val")}: \`${sysConfig.backupRelay || "—"}\`\n\n${t("tg_new_val")}\n_send empty to clear_`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_nat64") {
-                    tgState[chatId] = { step: "tg_edit_nat64" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🌐 **${t("tg_nat64")}**\n${t("tg_current_val")}: \`${sysConfig.nat64Prefix || "—"}\`\n\n${t("tg_new_val")}\n_send empty to clear_`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_maintenance") {
-                    tgState[chatId] = { step: "tg_edit_maintenance" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🎭 **${t("tg_maintenance")}**\n${t("tg_current_val")}: \`${sysConfig.maintenanceHost || "—"}\`\n\n${t("tg_new_val")}`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_clean_ips") {
-                    tgState[chatId] = { step: "tg_edit_clean_ips" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🧹 **${t("tg_clean_ips")}**\n${t("tg_current_val")}: \`${sysConfig.cleanIps || "—"}\`\n\n${t("tg_new_val")}\n_send empty to clear_`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_advanced_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_nodes") {
-                    let lpList = (sysConfig.linkedPanels || [])
-                        .map((p, i) => `${i + 1}. \`${p.url}\``)
-                        .join("\n");
-                    if (!lpList) lpList = "—";
-                    const warningMsg = langCode === "fa"
-                        ? `🖥️ **${t("tg_nodes")}**\n\n${lpList}\n\n⚠️ لطفاً برای افزودن، حذف یا ویرایش نودهای خارجی به صورت امن همراه با کلید دسترسی (API Key)، از داشبورد تحت وب استفاده کنید.`
-                        : `🖥️ **${t("tg_nodes")}**\n\n${lpList}\n\n⚠️ Please use the Web Dashboard to add, remove, or edit external nodes securely with API Keys.`;
-                    await sendOrEdit(
-                        chatId,
-                        warningMsg,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "◀️ " + t("btn_back"),
-                                        callback_data: "tg_advanced_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_strategy") {
-                    tgState[chatId] = { step: "tg_edit_strategy" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    const kb = {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: "default",
-                                    callback_data: "tg_set_strategy:default",
-                                },
-                            ],
-                            [
-                                {
-                                    text: "type-user-port",
-                                    callback_data:
-                                        "tg_set_strategy:type-user-port",
-                                },
-                            ],
-                            [
-                                {
-                                    text: "user-port",
-                                    callback_data: "tg_set_strategy:user-port",
-                                },
-                            ],
-                            [
-                                {
-                                    text: "ip",
-                                    callback_data: "tg_set_strategy:ip",
-                                },
-                            ],
-                            [
-                                {
-                                    text: "❌ " + t("btn_cancel"),
-                                    callback_data: "tg_advanced_menu",
-                                },
-                            ],
-                        ],
-                    };
-                    await sendOrEdit(
-                        chatId,
-                        `📝 **${t("tg_strategy")}**\n${t("tg_current_val")}: \`${sysConfig.nameStrategy}\`\n\n_send custom or select:_`,
-                        kb,
-                        messageId,
-                    );
-                } else if (data.startsWith("tg_set_strategy:")) {
-                    const val = data.replace("tg_set_strategy:", "");
-                    sysConfig.nameStrategy = val;
-                    await cachedD1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
-                    tgState[chatId] = null;
-                    answerText = t("tg_saved");
-                    await sendOrEdit(
-                        chatId,
-                        `✅ ${t("tg_strategy")}: **${val}**`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "◀️ " + t("btn_back"),
-                                        callback_data: "tg_advanced_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_prefix") {
-                    tgState[chatId] = { step: "tg_edit_prefix" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🏷️ **${t("tg_prefix")}**\n${t("tg_current_val")}: \`${sysConfig.namePrefix}\`\n\n${t("tg_new_val")}`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_advanced_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_pass") {
-                    tgState[chatId] = { step: "tg_edit_pass" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🔑 **${t("tg_pass")}**\n${t("tg_current_val")}: \`${sysConfig.masterKey}\`\n\n${t("tg_new_val")}`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_ports") {
-                    tgState[chatId] = { step: "tg_edit_ports" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🔌 **${t("tg_ports")}**\n${t("tg_current_val")}: \`${sysConfig.socketPorts}\`\n\n${t("tg_new_val")}\n_comma separated e.g. 443,80_`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_settings_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_tg_settings") {
-                    tgState[chatId] = { step: "tg_edit_tg_token" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `🤖 **${t("tg_tg_settings")}**\n\n1️⃣ ${t("tg_current_val")}: \`${sysConfig.tgToken ? "***" + sysConfig.tgToken.slice(-4) : "—"}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_advanced_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
-                } else if (data === "tg_edit_cf_settings") {
-                    tgState[chatId] = { step: "tg_edit_cf_acc" };
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
-                    await sendOrEdit(
-                        chatId,
-                        `☁️ **${t("tg_cf_settings")}**\n\n1️⃣ CF Account ID: \`${sysConfig.cfAccountId || "—"}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`,
-                        {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: "❌ " + t("btn_cancel"),
-                                        callback_data: "tg_advanced_menu",
-                                    },
-                                ],
-                            ],
-                        },
-                        messageId,
-                    );
                 }
 
                 ctx?.waitUntil(
@@ -5070,981 +3535,15 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const text = update.message.text.trim();
 
             if (isAuthorized) {
-                // Get active panel from last login signal
                 const activePanel = getActivePanel();
-                const isRemotePanel = activePanel && !activePanel.isLocal;
-
-                // Helper to fetch users for the active panel
-                const getPanelUsers = async () => {
-                    if (isRemotePanel) {
-                        const res = await fetchRemotePanelUsers(activePanel);
-                        return res.success ? res.users || [] : null;
-                    }
-                    return sysConfig.users || [];
-                };
-
-                // Handle /start command
                 if (text === "/start") {
                     tgState[chatId] = null;
-                    ctx?.waitUntil(
-                        d1Put(
-                            env,
-                            "tg_bot_state",
-                            JSON.stringify(tgState),
-                        ).catch(() => {}),
-                    );
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb);
                     return new Response("OK", { status: 200 });
                 }
-
-                const state = tgState[chatId];
-
-                if (state) {
-                    if (!isAuthorized) {
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(chatId, t("access_denied"));
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step === "sub_add_name") {
-                        const name = text;
-                        tgState[chatId] = {
-                            step: "sub_add_limits",
-                            name: name,
-                        };
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-
-                        const msg = `⚙️ **${name}**\n\n${t("msg_enter_limits")}`;
-                        const kb = {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: `♾️ Skip (Unlimited)`,
-                                        callback_data: "sub_add_unlimited_skip",
-                                    },
-                                ],
-                                [
-                                    {
-                                        text: `❌ ${t("btn_cancel")}`,
-                                        callback_data: "main_menu",
-                                    },
-                                ],
-                            ],
-                        };
-                        await sendOrEdit(chatId, msg, kb);
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (
-                        state.step === "sub_add_limits" ||
-                        state.step === "sub_add_unlimited_skip"
-                    ) {
-                        const name = state.name;
-                        let tReq = null;
-                        let dReq = null;
-                        let days = null;
-
-                        if (
-                            state.step !== "sub_add_unlimited_skip" &&
-                            text !== "0" &&
-                            text !== "0 0 0"
-                        ) {
-                            const parts = text.split(/\s+/).map(Number);
-                            if (parts[0] > 0) tReq = parts[0];
-                            if (parts[1] > 0) dReq = parts[1];
-                            if (parts[2] > 0) days = parts[2];
-                        }
-
-                        const newUuid = crypto.randomUUID();
-                        if (isRemotePanel) {
-                            const res = await remotePanelWriteAction(
-                                activePanel,
-                                "POST",
-                                null,
-                                {
-                                    key: activePanel.apiKey,
-                                    name: name,
-                                    trafficLimit: tReq ? tReq / 6000 : 0,
-                                    dailyLimit: dReq ? dReq / 6000 : 0,
-                                    expiryDays: days || 0,
-                                },
-                            );
-                            if (res.success && res.user) {
-                                const detail = getSubDetail(res.user.id, [
-                                    res.user,
-                                ]);
-                                await sendOrEdit(
-                                    chatId,
-                                    `✅ ${t("msg_added")}\n\n${detail.text}`,
-                                    detail.kb,
-                                );
-                            } else {
-                                await sendOrEdit(chatId, t("msg_panel_error"), {
-                                    inline_keyboard: [
-                                        [
-                                            {
-                                                text: t("btn_main_menu"),
-                                                callback_data: "main_menu",
-                                            },
-                                        ],
-                                    ],
-                                });
-                            }
-                        } else {
-                            if (!sysConfig.users) sysConfig.users = [];
-                            sysConfig.users.push({
-                                id: newUuid,
-                                name: name,
-                                limitTotalReq: tReq,
-                                limitDailyReq: dReq,
-                                expiryMs: days
-                                    ? Date.now() + days * 86400000
-                                    : null,
-                                createdAt: Date.now(),
-                            });
-                            await cachedD1Put(
-                                env,
-                                "sys_config",
-                                JSON.stringify(sysConfig),
-                            );
-                            const detail = getSubDetail(newUuid);
-                            await sendOrEdit(
-                                chatId,
-                                `✅ ${t("msg_added")}\n\n${detail.text}`,
-                                detail.kb,
-                            );
-                        }
-
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_edit_name:")) {
-                        const uuid = state.step.replace("sub_edit_name:", "");
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(
-                                activePanel,
-                                "PUT",
-                                uuid,
-                                { key: activePanel.apiKey, name: text },
-                            );
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(
-                                (usr) => usr.id === uuid,
-                            );
-                            if (u) {
-                                u.name = text;
-                                await cachedD1Put(
-                                    env,
-                                    "sys_config",
-                                    JSON.stringify(sysConfig),
-                                );
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(
-                            chatId,
-                            `✅ Successfully Changed!`,
-                            detail.kb,
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_edit_limits:")) {
-                        const uuid = state.step.replace("sub_edit_limits:", "");
-                        let tReq = null;
-                        let dReq = null;
-                        let days = null;
-
-                        const parts = text.split(/\s+/).map(Number);
-                        if (parts[0] > 0) tReq = parts[0];
-                        if (parts[1] > 0) dReq = parts[1];
-                        if (parts[2] > 0) days = parts[2];
-
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(
-                                activePanel,
-                                "PUT",
-                                uuid,
-                                {
-                                    key: activePanel.apiKey,
-                                    trafficLimit: tReq ? tReq / 6000 : 0,
-                                    dailyLimit: dReq ? dReq / 6000 : 0,
-                                    expiryDays: days || 0,
-                                },
-                            );
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(
-                                (usr) => usr.id === uuid,
-                            );
-                            if (u) {
-                                u.limitTotalReq = tReq;
-                                u.limitDailyReq = dReq;
-                                u.expiryMs = days
-                                    ? Date.now() + days * 86400000
-                                    : null;
-                                await cachedD1Put(
-                                    env,
-                                    "sys_config",
-                                    JSON.stringify(sysConfig),
-                                );
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(
-                            chatId,
-                            `✅ Limits Updated!`,
-                            detail.kb,
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step === "sub_search") {
-                        const query = text.toLowerCase();
-                        const panelUsers = await getPanelUsers();
-                        const users = panelUsers || [];
-                        const results = users.filter(
-                            (u) =>
-                                u.name.toLowerCase().includes(query) ||
-                                u.id.toLowerCase().includes(query),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        if (results.length === 0) {
-                            const kb = {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: t("btn_main_menu"),
-                                            callback_data: "main_menu",
-                                        },
-                                    ],
-                                ],
-                            };
-                            await sendOrEdit(
-                                chatId,
-                                `🔍 No users found for "${text}"`,
-                                kb,
-                            );
-                        } else {
-                            let searchText = `🔍 **Search Results** (${results.length})\n━━━━━━━━━━━━━━━━\n`;
-                            const inline_keyboard = [];
-                            results.slice(0, 10).forEach((u) => {
-                                const statusEmoji = u.isPaused
-                                    ? "⏸️"
-                                    : u.expiryMs && Date.now() > u.expiryMs
-                                      ? "🔴"
-                                      : "🟢";
-                                searchText += `${statusEmoji} **${u.name}**\n`;
-                                inline_keyboard.push([
-                                    {
-                                        text: `👤 ${u.name}`,
-                                        callback_data: `sub_detail:${u.id}`,
-                                    },
-                                ]);
-                            });
-                            inline_keyboard.push([
-                                {
-                                    text: t("btn_main_menu"),
-                                    callback_data: "main_menu",
-                                },
-                            ]);
-                            await sendOrEdit(chatId, searchText, {
-                                inline_keyboard,
-                            });
-                        }
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_extend_days:")) {
-                        const uuid = state.step.replace("sub_extend_days:", "");
-                        const days = parseInt(text);
-                        if (isNaN(days) || days <= 0) {
-                            await sendOrEdit(chatId, t("msg_invalid"));
-                            return new Response("OK", { status: 200 });
-                        }
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(
-                                activePanel,
-                                "PUT",
-                                uuid,
-                                { key: activePanel.apiKey, expiryDays: days },
-                            );
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(
-                                (usr) => usr.id === uuid,
-                            );
-                            if (u) {
-                                if (u.expiryMs) {
-                                    u.expiryMs += days * 86400000;
-                                } else {
-                                    u.expiryMs = Date.now() + days * 86400000;
-                                }
-                                if (
-                                    u.isPaused &&
-                                    u.disabledReason &&
-                                    u.disabledReason.includes("Expiration")
-                                ) {
-                                    u.isPaused = false;
-                                    u.disabledReason = null;
-                                    u.disabledAt = null;
-                                }
-                                await cachedD1Put(
-                                    env,
-                                    "sys_config",
-                                    JSON.stringify(sysConfig),
-                                );
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        const msg = t("msg_expiry_extended").replace(
-                            "{days}",
-                            days,
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${msg}\n\n${detail.text}`,
-                            detail.kb,
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_edit_notes:")) {
-                        const uuid = state.step.replace("sub_edit_notes:", "");
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(
-                                activePanel,
-                                "PUT",
-                                uuid,
-                                { key: activePanel.apiKey, notes: text },
-                            );
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(
-                                (usr) => usr.id === uuid,
-                            );
-                            if (u) {
-                                u.notes = text;
-                                await cachedD1Put(
-                                    env,
-                                    "sys_config",
-                                    JSON.stringify(sysConfig),
-                                );
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(
-                            chatId,
-                            `✅ Notes updated!`,
-                            detail.kb,
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step.startsWith("sub_edit_device:")) {
-                        const uuid = state.step.replace("sub_edit_device:", "");
-                        const limit = parseInt(text);
-                        if (isNaN(limit) || limit < 0) {
-                            await sendOrEdit(chatId, t("msg_invalid"));
-                            return new Response("OK", { status: 200 });
-                        }
-                        if (isRemotePanel) {
-                            await remotePanelWriteAction(
-                                activePanel,
-                                "PUT",
-                                uuid,
-                                {
-                                    key: activePanel.apiKey,
-                                    maxConfigs: limit > 0 ? limit : null,
-                                },
-                            );
-                        } else if (sysConfig.users) {
-                            const u = sysConfig.users.find(
-                                (usr) => usr.id === uuid,
-                            );
-                            if (u) {
-                                u.maxConfigs = limit > 0 ? limit : null;
-                                await cachedD1Put(
-                                    env,
-                                    "sys_config",
-                                    JSON.stringify(sysConfig),
-                                );
-                            }
-                        }
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        const panelUsers = await getPanelUsers();
-                        const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("config_limit_updated")}`,
-                            detail.kb,
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-
-                    if (state.step === "tg_edit_dns") {
-                        sysConfig.resolveIp = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_dns")}: \`${text}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_settings_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_relay") {
-                        sysConfig.backupRelay = text || "";
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_relay")}: \`${text || "—"}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_settings_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_nat64") {
-                        sysConfig.nat64Prefix = text || "";
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_nat64")}: \`${text || "—"}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_settings_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_maintenance") {
-                        sysConfig.maintenanceHost = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_maintenance")}: \`${text}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_clean_ips") {
-                        sysConfig.cleanIps = text || "";
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_clean_ips")}: \`${text || "—"}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_prefix") {
-                        sysConfig.namePrefix = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_prefix")}: \`${text}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_pass") {
-                        sysConfig.masterKey = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_pass")}: \`${text}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_settings_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_strategy") {
-                        sysConfig.nameStrategy = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_strategy")}: \`${text}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_tg_token") {
-                        if (text !== "/skip") sysConfig.tgToken = text;
-                        tgState[chatId] = { step: "tg_edit_tg_chat" };
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `2️⃣ Chat ID: \`${sysConfig.tgChatId || "—"}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "❌ " + t("btn_cancel"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_tg_chat") {
-                        if (text !== "/skip") sysConfig.tgChatId = text;
-                        tgState[chatId] = { step: "tg_edit_tg_admin" };
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `3️⃣ Admin ID: \`${sysConfig.tgAdminId || "—"}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "❌ " + t("btn_cancel"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_tg_admin") {
-                        if (text !== "/skip") sysConfig.tgAdminId = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_tg_settings")} saved!`,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_cf_acc") {
-                        if (text !== "/skip") sysConfig.cfAccountId = text;
-                        tgState[chatId] = { step: "tg_edit_cf_token" };
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `2️⃣ CF API Token: \`${sysConfig.cfApiToken ? "***" + sysConfig.cfApiToken.slice(-4) : "—"}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "❌ " + t("btn_cancel"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_cf_token") {
-                        if (text !== "/skip") sysConfig.cfApiToken = text;
-                        tgState[chatId] = { step: "tg_edit_cf_worker" };
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `3️⃣ CF Worker Name: \`${sysConfig.cfWorkerName || "—"}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "❌ " + t("btn_cancel"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_cf_worker") {
-                        if (text !== "/skip") sysConfig.cfWorkerName = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_cf_settings")} saved!`,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_advanced_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                    if (state.step === "tg_edit_ports") {
-                        sysConfig.socketPorts = text;
-                        await cachedD1Put(
-                            env,
-                            "sys_config",
-                            JSON.stringify(sysConfig),
-                        );
-                        tgState[chatId] = null;
-                        ctx?.waitUntil(
-                            d1Put(
-                                env,
-                                "tg_bot_state",
-                                JSON.stringify(tgState),
-                            ).catch(() => {}),
-                        );
-                        await sendOrEdit(
-                            chatId,
-                            `✅ ${t("tg_ports")}: \`${text}\``,
-                            {
-                                inline_keyboard: [
-                                    [
-                                        {
-                                            text: "◀️ " + t("btn_back"),
-                                            callback_data: "tg_settings_menu",
-                                        },
-                                    ],
-                                ],
-                            },
-                        );
-                        return new Response("OK", { status: 200 });
-                    }
-                }
-
-                // Default message / fallback menu
                 const menu = getMainMenu(activePanel, isAuthorized);
                 await sendOrEdit(chatId, menu.text, menu.kb);
-            } else {
-                if (text === "/start") {
-                    const userHint =
-                        langCode === "fa"
-                            ? "لطفاً لینک اشتراک یا شناسه کاربری خود را ارسال کنید تا اطلاعات اشتراکتان نمایش داده شود."
-                            : "Please send your subscription link or User ID to view your subscription info.";
-                    await sendOrEdit(chatId, userHint);
-                    return new Response("OK", { status: 200 });
-                }
-                let lookupId = text
-                    .replace(/^https?:\/\//, "")
-                    .replace(/\/.*$/, "")
-                    .trim();
-                const subParamMatch = text.match(/[?&]sub=([^&]+)/);
-                if (subParamMatch)
-                    lookupId = decodeURIComponent(subParamMatch[1]);
-                if (!lookupId || lookupId.length < 3) {
-                    const userHint =
-                        langCode === "fa"
-                            ? "لطفاً لینک اشتراک یا شناسه کاربری معتبر ارسال کنید."
-                            : "Please send a valid subscription link or User ID.";
-                    await sendOrEdit(chatId, userHint);
-                    return new Response("OK", { status: 200 });
-                }
-                const users = sysConfig.users || [];
-                const matchedUser = users.find(
-                    (u) =>
-                        u.id === lookupId ||
-                        u.id.replace(/-/g, "").toLowerCase() ===
-                            lookupId.replace(/-/g, "").toLowerCase() ||
-                        u.name.toLowerCase() === lookupId.toLowerCase(),
-                );
-                if (matchedUser) {
-                    const detail = getSubDetail(matchedUser.id);
-                    await sendOrEdit(chatId, detail.text, detail.kb);
-                } else {
-                    const notFound =
-                        langCode === "fa"
-                            ? "کاربری با این شناسه یافت نشد."
-                            : "No user found with this ID.";
-                    await sendOrEdit(chatId, notFound);
-                }
             }
         }
         return new Response("OK", { status: 200 });
@@ -6341,7 +3840,6 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                     .filter(Boolean);
             }
 
-            // Consistent hash based on user/profile ID to prevent session/IP splitting across assets on Cloudflare
             let startIndex = 0;
             if (pips.length > 1) {
                 let hash = 0;
@@ -6352,7 +3850,6 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 startIndex = Math.abs(hash) % pips.length;
             }
 
-            // Attempt to connect with automatic failover to alternative proxy IPs
             let connected = false;
             for (
                 let attempt = 0;
@@ -6362,7 +3859,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 let currentIndex = (startIndex + attempt) % pips.length;
                 let currentProxy = pips[currentIndex];
                 try {
-                    const [altIP, altPortStr] = currentProxy.split(":");
+                    let [altIP, altPortStr] = currentProxy.split(":");
                     remoteSocket = connect({
                         hostname: altIP,
                         port: altPortStr ? Number(altPortStr) : targetPort,
@@ -6370,9 +3867,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                     await remoteSocket.opened;
                     connected = true;
                     break;
-                } catch (e) {
-                    // Try next fallback proxy IP in list
-                }
+                } catch (e) {}
             }
             if (!connected) {
                 webSocket.close();
@@ -6479,24 +3974,6 @@ function getFakeConfigNames(targetSub = null) {
         });
 }
 
-function getCleanIps(hostName, userCleanIps = null) {
-    let rawIps = userCleanIps || sysConfig.cleanIps;
-    let ips = rawIps
-        ? rawIps
-              .split(/[\r\n,;]+/)
-              .map((s) => {
-                  let t = s.trim();
-                  return t ? t.split("#")[0].trim() : "";
-              })
-              .filter(Boolean)
-        : [];
-    if (ips.length === 0)
-        ips = [
-            hostName.endsWith(".pages.dev") ? sysConfig.metricNode : hostName,
-        ];
-    return ips;
-}
-
 function getCleanIpsWithNames(hostName, userCleanIps = null) {
     let rawIps = userCleanIps || sysConfig.cleanIps;
     let entries = rawIps
@@ -6545,20 +4022,6 @@ function getAllProfiles(targetSub = null) {
                 )
                     skip = true;
             }
-            if (
-                u.limitDailyReq &&
-                sysUsageCache &&
-                sysUsageCache.users &&
-                sysUsageCache.users[u.id.replace(/-/g, "").toLowerCase()]
-            ) {
-                let usr =
-                    sysUsageCache.users[u.id.replace(/-/g, "").toLowerCase()];
-                if (
-                    usr.lastDay === new Date().toISOString().split("T")[0] &&
-                    usr.dReqs >= u.limitDailyReq
-                )
-                    skip = true;
-            }
             if (!skip) {
                 list.push({
                     id: u.id,
@@ -6587,24 +4050,19 @@ function getAllProfiles(targetSub = null) {
     return list;
 }
 
-// Returns the hostname of a linked panel URL (strips scheme/path/port). The
-// linkedPanels API system (cross-panel sync) is untouched; here we only read
-// its URLs as extra parallel node hosts, restoring 2.6 "parallel node" behavior.
 function linkedPanelHost(p) {
     let raw = p && typeof p === "object" ? p.url || "" : p || "";
     raw = String(raw).trim();
     if (!raw) return "";
-    raw = raw.replace(/^[a-zA-Z]+:\/\//, ""); // drop scheme
-    raw = raw.split("/")[0]; // drop path
-    raw = raw.split("@").pop(); // drop credentials
+    raw = raw.replace(/^[a-zA-Z]+:\/\//, "");
+    raw = raw.split("/")[0];
+    raw = raw.split("@").pop();
     if (raw.startsWith("[")) {
-        // [ipv6]:port
         return raw.slice(0, raw.indexOf("]") + 1);
     }
-    return raw.split(":")[0]; // drop port
+    return raw.split(":")[0];
 }
 
-// Combined parallel-node host list = slaveNodes (legacy) + linkedPanels URLs (2.9 API).
 function getGlobalNodeHosts() {
     let hosts = [];
     if (sysConfig.slaveNodes)
@@ -6706,22 +4164,12 @@ async function preloadIpFlags(profiles, hostNames) {
     let uniqueIps = new Set();
     profiles.forEach((p) => {
         hostNames.forEach((h) => {
-            getCleanIps(h, p.cleanIp).forEach((ip) => uniqueIps.add(ip));
+            getCleanIpsWithNames(h, p.cleanIp).forEach((e) => uniqueIps.add(e.ip));
         });
         if (p.proxyIp) {
             getProxyIpsArray(p.proxyIp).forEach((ip) => uniqueIps.add(ip));
         }
     });
-    if (sysConfig.backupRelay) {
-        getProxyIpsArray(sysConfig.backupRelay).forEach((ip) =>
-            uniqueIps.add(ip),
-        );
-    }
-    if (sysConfig.customRelay) {
-        getProxyIpsArray(sysConfig.customRelay).forEach((ip) =>
-            uniqueIps.add(ip),
-        );
-    }
 
     let uncached = Array.from(uniqueIps).filter((ip) => !ipGeoCache.has(ip));
     for (let i = 0; i < uncached.length; i += 100) {
@@ -6771,31 +4219,8 @@ async function preloadIpFlags(profiles, hostNames) {
                     });
                 }
             });
-        } catch (e) {
-            batch.forEach((ip) => {
-                if (!ipGeoCache.has(ip)) {
-                    ipGeoCache.set(ip, {
-                        flag: "🌐",
-                        country: "Unknown",
-                        countryCode: "",
-                        city: "",
-                        isp: "",
-                    });
-                }
-            });
-        }
+        } catch (e) {}
     }
-}
-
-function getEmojiFlag(ip) {
-    if (!ip) return "🌐";
-    let clean = ip
-        .split(":")[0]
-        .replace(/[\[\]]/g, "")
-        .split("#")[0]
-        .trim();
-    let geo = ipGeoCache.get(ip) || ipGeoCache.get(clean);
-    return geo ? geo.flag : "🌐";
 }
 
 function getGeoInfo(ip) {
@@ -6824,35 +4249,6 @@ function getGeoInfo(ip) {
     );
 }
 
-async function fetchIpGeoData(ip) {
-    if (!ip) return null;
-    let clean = ip
-        .split(":")[0]
-        .replace(/[\[\]]/g, "")
-        .split("#")[0]
-        .trim();
-    try {
-        const res = await fetch(
-            `http://ip-api.com/json/${clean}?fields=status,country,countryCode,city,isp,org`,
-        );
-        const data = await res.json();
-        if (data && data.status === "success") {
-            const codePoints = data.countryCode
-                .toUpperCase()
-                .split("")
-                .map((char) => 127397 + char.charCodeAt());
-            return {
-                flag: String.fromCodePoint(...codePoints),
-                country: data.country || "Unknown",
-                countryCode: data.countryCode || "",
-                city: data.city || "",
-                isp: data.isp || data.org || "",
-            };
-        }
-    } catch (e) {}
-    return null;
-}
-
 async function resolveUserProxyIpGeo(user) {
     if (!user.proxyIp) {
         user.proxyIpGeo = null;
@@ -6863,14 +4259,6 @@ async function resolveUserProxyIpGeo(user) {
         user.proxyIpGeo = null;
         return;
     }
-    let geoData = await fetchIpGeoData(pips[0]);
-    user.proxyIpGeo = geoData || {
-        flag: "🌐",
-        country: "Unknown",
-        countryCode: "",
-        city: "",
-        isp: "",
-    };
 }
 
 function getConfigName(
@@ -6886,7 +4274,6 @@ function getConfigName(
 ) {
     let prefix = sysConfig.namePrefix || "Core";
     let strategy = sysConfig.nameStrategy || "default";
-    let cleanName = profileName === "Default" ? "" : `-${profileName}`;
     let typeLab = type === "alpha" ? "V" : "T";
 
     if (strategy.includes("{") && strategy.includes("}")) {
@@ -6903,7 +4290,7 @@ function getConfigName(
         let workerName =
             sysConfig.cfWorkerName || sysConfig.name || hostName || "";
         let flagToUse = isDirect ? "☁️" : geoInfo.flag;
-        let resName = strategy
+        return strategy
             .replace(/{FLAG}/g, flagToUse)
             .replace(/{COUNTRY}/g, geoInfo.country)
             .replace(/{CITY}/g, geoInfo.city)
@@ -6918,23 +4305,8 @@ function getConfigName(
             .replace(/{DATE}/g, dateStr)
             .replace(/{INDEX}/g, String(configIndex))
             .replace(/{WORKER}/g, workerName);
-        return resName;
     }
-
-    if (strategy === "type-user-port") {
-        return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${profileName}-${port}`;
-    } else if (strategy === "user-port") {
-        return `${profileName}-${port}`;
-    } else if (strategy === "host-port-user") {
-        return `${hostName}-${port}${cleanName}`;
-    } else if (strategy === "prefix-user-port") {
-        return `${prefix}${cleanName}-${port}`;
-    } else if (strategy === "ip") {
-        return ip || "unknown";
-    } else {
-        // "default"
-        return `${typeLab}-Core-${port}${cleanName}`;
-    }
+    return `${typeLab}-Core-${port}`;
 }
 
 function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts, pipsCount = 1) {
@@ -6996,2012 +4368,29 @@ function getEffectivePips(p) {
     return pips;
 }
 
-// ─── Upstream VLESS URI Parser ───────────────────────────────────────
-// Parses a VLESS URI like:
-//   vless://uuid@server:port?type=ws&security=tls&sni=example.com&path=/ws#Name
-// into a structured object usable by Sing-Box, Clash, and V2Ray builders.
 function parseVlessUri(uri) {
-    if (!uri || typeof uri !== "string") return null;
-    uri = uri.trim();
-    if (!uri.startsWith("vless://")) return null;
-    try {
-        // Remove the scheme
-        let rest = uri.slice(8); // after "vless://"
-        // Split fragment (#name)
-        let fragment = "";
-        let hashIdx = rest.indexOf("#");
-        if (hashIdx !== -1) {
-            fragment = decodeURIComponent(rest.slice(hashIdx + 1));
-            rest = rest.slice(0, hashIdx);
-        }
-        // Split query string (?params)
-        let queryStr = "";
-        let qIdx = rest.indexOf("?");
-        if (qIdx !== -1) {
-            queryStr = rest.slice(qIdx + 1);
-            rest = rest.slice(0, qIdx);
-        }
-        // Parse query params
-        let params = {};
-        if (queryStr) {
-            queryStr.split("&").forEach((pair) => {
-                let [k, v] = pair.split("=");
-                if (k) params[decodeURIComponent(k)] = decodeURIComponent(v || "");
-            });
-        }
-        // Parse uuid@server:port
-        let atIdx = rest.indexOf("@");
-        if (atIdx === -1) return null;
-        let uuid = rest.slice(0, atIdx);
-        let hostPort = rest.slice(atIdx + 1);
-        let server, port;
-        // Handle IPv6 [addr]:port
-        if (hostPort.startsWith("[")) {
-            let bracketEnd = hostPort.indexOf("]");
-            server = hostPort.slice(1, bracketEnd);
-            port = parseInt(hostPort.slice(bracketEnd + 2)) || 443;
-        } else {
-            let colonIdx = hostPort.lastIndexOf(":");
-            server = hostPort.slice(0, colonIdx);
-            port = parseInt(hostPort.slice(colonIdx + 1)) || 443;
-        }
-        return {
-            uuid,
-            server,
-            port,
-            name: fragment || "Upstream",
-            security: params.security || "tls",
-            sni: params.sni || params.servername || server,
-            host: params.host || server,
-            path: params.path || "/",
-            type: params.type || "ws",
-            fp: params.fp || params["client-fingerprint"] || "random",
-            allowInsecure: params.allowInsecure === "1" || params.allowInsecure === "true",
-            pbk: params.pbk || "",
-            sid: params.sid || "",
-            flow: params.flow || "",
-            encryption: params.encryption || "none",
-            alpn: params.alpn || "",
-            mode: params.mode || "",
-            raw: uri,
-        };
-    } catch (e) {
-        return null;
-    }
+    return null;
 }
 
-// Convert parsed VLESS URI to a Sing-Box outbound object
-function upstreamToSingboxOb(parsed) {
-    if (!parsed) return null;
-    let ob = {
-        type: "vless",
-        tag: "🔗 " + parsed.name,
-        server: parsed.server,
-        server_port: parsed.port,
-        uuid: parsed.uuid,
-        packet_encoding: "xudp",
-        network: parsed.type || "ws",
-        tls: {
-            enabled: parsed.security === "tls" || parsed.security === "reality",
-            server_name: parsed.sni,
-            insecure: parsed.allowInsecure,
-            utls: { enabled: true, fingerprint: parsed.fp || "randomized" },
-        },
-        transport: {
-            type: parsed.type || "ws",
-            path: parsed.path || "/",
-            headers: { Host: parsed.host || parsed.sni },
-        },
-    };
-    if (parsed.flow) ob.flow = parsed.flow;
-    if (parsed.pbk) {
-        ob.tls.reality = {
-            enabled: true,
-            public_key: parsed.pbk,
-            short_id: parsed.sid || "",
-        };
-    }
-    if (parsed.alpn) ob.tls.alpn = parsed.alpn.split(",");
-    return ob;
-}
-
-// Convert parsed VLESS URI to a Clash/Mihomo proxy object (YAML-compatible)
-function upstreamToClashProxy(parsed) {
-    if (!parsed) return null;
-    let proxy = {
-        name: parsed.name,
-        type: "vless",
-        server: parsed.server,
-        port: parsed.port,
-        uuid: parsed.uuid,
-        udp: true,
-        tls: parsed.security === "tls" || parsed.security === "reality",
-        servername: parsed.sni,
-        "client-fingerprint": parsed.fp || "random",
-        "skip-cert-verify": parsed.allowInsecure,
-        network: parsed.type || "ws",
-        "ws-opts": {
-            path: parsed.path || "/",
-            headers: { Host: parsed.host || parsed.sni },
-        },
-    };
-    if (parsed.flow) proxy.flow = parsed.flow;
-    if (parsed.pbk) {
-        proxy["reality-opts"] = {
-            "public-key": parsed.pbk,
-            "short-id": parsed.sid || "",
-        };
-    }
-    if (parsed.alpn) proxy.alpn = parsed.alpn.split(",");
-    return proxy;
-}
-
-// Convert parsed VLESS URI to a V2Ray JSON outbound object
-function upstreamToV2RayOb(parsed) {
-    if (!parsed) return null;
-    let ob = {
-        tag: "🔗 " + parsed.name,
-        protocol: "vless",
-        settings: {
-            vnext: [
-                {
-                    address: parsed.server,
-                    port: parsed.port,
-                    users: [
-                        {
-                            id: parsed.uuid,
-                            encryption: parsed.encryption || "none",
-                            flow: parsed.flow || "",
-                        },
-                    ],
-                },
-            ],
-        },
-        streamSettings: {
-            network: parsed.type || "ws",
-            security: parsed.security === "tls" || parsed.security === "reality" ? "tls" : "none",
-            tlsSettings: parsed.security === "tls" ? {
-                serverName: parsed.sni,
-                allowInsecure: parsed.allowInsecure,
-                fingerprint: parsed.fp || "random",
-            } : undefined,
-            realitySettings: parsed.security === "reality" ? {
-                serverName: parsed.sni,
-                publicKey: parsed.pbk || "",
-                shortId: parsed.sid || "",
-                fingerprint: parsed.fp || "random",
-            } : undefined,
-            wsSettings: {
-                path: parsed.path || "/",
-                headers: { Host: parsed.host || parsed.sni },
-            },
-        },
-    };
-    return ob;
-}
-
-async function buildUriProfile(
-    hostName,
-    targetSub = null,
-    allowInsecure = false,
-) {
-    let ports = sysConfig.socketPorts
-        ? sysConfig.socketPorts
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-        : ["443"];
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-
+async function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
+    let ports = ["443"];
     let lines = [];
     let profiles = getAllProfiles(targetSub);
-    let allHostNames = [
-        ...new Set(profiles.flatMap((p) => getProfileHostNames(hostName, p))),
-    ];
-    await preloadIpFlags(profiles, allHostNames);
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    fakeNames.forEach((name) => {
-        lines.push(
-            `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:1080?security=none#${encodeURIComponent(name)}`,
-        );
-    });
-
-    profiles.forEach((p) => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts
-            ? p.userPorts
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean)
-            : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach((hName) => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map((e) => e.ip);
-            let ips = calcEffectiveIps(
-                allIps,
-                maxCfg,
-                effectiveMode,
-                effectivePorts,
-                pips.length
-            );
-            let ipNameMap = {};
-            ipEntries.forEach((e) => {
-                ipNameMap[e.ip] = e.name;
-            });
-            effectivePorts.forEach((port) => {
-                let sec = getTransportParams(port);
-                let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
-                if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
-                extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                ips.forEach((ip) => {
-                    let _pips = pips.length > 0 ? pips : [null];
-                    _pips.forEach((selectedProxyIp) => {
-                    let ipName = ipNameMap[ip] || "";
-                    let vName = getConfigName(
-                        "alpha",
-                        p.name,
-                        port,
-                        hName,
-                        ip,
-                        selectedProxyIp,
-                        configIndex,
-                        ipName,
-                    );
-                    let tName = getConfigName(
-                        "beta",
-                        p.name,
-                        port,
-                        hName,
-                        ip,
-                        selectedProxyIp,
-                        configIndex,
-                        ipName,
-                    );
-                    if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(
-                            configUuid,
-                            p.id,
-                            selectedProxyIp || "",
-                        );
-                        lines.push(
-                            `${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${vName}`,
-                        );
-                    }
-                    if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let randomJunk = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadTr = {
-                            junk: randomJunk,
-                            protocol: "tr",
-                            mode: "proxyip",
-                            panelIPs: [],
-                            relayIdx: configIndex,
-                        };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        let trojanExtBase = `security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr)}`;
-                        if (sysConfig.enableOpt2)
-                            trojanExtBase += `&pbk=enabled`;
-                        trojanExtBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                        lines.push(
-                            `${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase}#${tName}`,
-                        );
-                    }
-                    if (sysConfig.enableDirectConfigs && pips.length > 0 && selectedProxyIp === pips[0]) {
-                        configIndex++;
-                        let dvName = getConfigName(
-                            "alpha",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            null,
-                            configIndex,
-                            ipName,
-                            true
-                        );
-                        let dtName = getConfigName(
-                            "beta",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            null,
-                            configIndex,
-                            ipName,
-                            true
-                        );
-                        if (
-                            effectiveMode === "alpha" ||
-                            effectiveMode === "both"
-                        ) {
-                            let configUuid = generateConfigUuid(
-                                p.id,
-                                configIndex,
-                            );
-                            registerConfigEntry(configUuid, p.id, "");
-                            lines.push(
-                                `${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${dvName}`,
-                            );
-                        }
-                        if (
-                            effectiveMode === "beta" ||
-                            effectiveMode === "both"
-                        ) {
-                            let randomJunk2 = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadTr2 = {
-                                junk: randomJunk2,
-                                protocol: "tr",
-                                mode: "proxyip",
-                                panelIPs: [],
-                                relayIdx: configIndex,
-                            };
-                            let pathStrTr2 =
-                                "/" + btoa(JSON.stringify(payloadTr2));
-                            let trojanExtBase2 = `security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr2)}`;
-                            if (sysConfig.enableOpt2)
-                                trojanExtBase2 += `&pbk=enabled`;
-                            trojanExtBase2 += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                            lines.push(
-                                `${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase2}#${dtName}`,
-                            );
-                        }
-                    }
-                    configIndex++;
-                    });
-                });
-            });
-        });
-    });
-    // ─── Upstream: prepend upstream URI ───
-    let parsedUpstream = parseVlessUri(sysConfig.upstreamUri);
-    if (parsedUpstream) {
-        lines.unshift(parsedUpstream.raw);
-    }
     return lines.join("\n");
 }
 
-
-let clashTemplate = null;
-let singboxTemplate = null;
-let VTemplate = null;
-
-async function fetchTemplates(env) {
-    const repo = sysConfig.githubRepo || "itsyebekhe/nahan";
-    if (!clashTemplate) {
-        try {
-            let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/clash.yml`);
-            if (res.ok) clashTemplate = await res.text();
-        } catch(e) {}
-    }
-    if (!singboxTemplate) {
-        try {
-            let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/singbox.json`);
-            if (res.ok) singboxTemplate = await res.json();
-        } catch(e) {}
-    }
-    if (!VTemplate) {
-        try {
-            let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/v.json`);
-            if (res.ok) VTemplate = await res.json();
-        } catch(e) {}
-    }
-}
-
-
-function getCustomRouting() {
-    let cr = sysConfig.customRouting || "";
-    let lines = cr.split('\n').map(l => l.trim()).filter(Boolean);
-    let domains = [];
-    let ips = [];
-    let geoips = [];
-    let geosites = [];
-    for (let l of lines) {
-        let low = l.toLowerCase();
-        if (low.startsWith("geoip:")) {
-            geoips.push(l.substring(6).trim().toUpperCase());
-        } else if (low.startsWith("geosite:")) {
-            geosites.push(l.substring(8).trim().toLowerCase());
-        } else if (l.match(/^[0-9\.\/:]+$/)) {
-            ips.push(l);
-        } else {
-            domains.push(l);
-        }
-    }
-    return { domains, ips, geoips, geosites };
-}
-
 async function buildYamlProfile(hostName, targetSub = null, allowInsecure = false, env = null) {
-    let ports = sysConfig.socketPorts
-        ? sysConfig.socketPorts
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-        : ["443"];
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    let proxies = [];
-    let proxyNames = [];
-    let nameCounts = {}; // Track proxy names for deduplication
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [
-        ...new Set(profiles.flatMap((p) => getProfileHostNames(hostName, p))),
-    ];
-    await preloadIpFlags(profiles, allHostNames);
-    let proxyGeoInfo = new Map(); // proxyName -> {country, flag}
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    let fakeRefs = [];
-    fakeNames.forEach((name) => {
-        proxies.push(
-            `- name: "${name}"\n  type: ${getBeta()}\n  server: 127.0.0.1\n  port: 80\n  password: "${activeDeviceId}"\n  udp: true\n  tls: false`,
-        );
-        fakeRefs.push(`"${name}"`);
-    });
-
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) {
-            nameCounts[baseName] = 1;
-            return baseName;
-        }
-        let counter = nameCounts[baseName];
-        let newName = `${baseName}-${counter}`;
-        while (nameCounts[newName]) {
-            counter++;
-            newName = `${baseName}-${counter}`;
-        }
-        nameCounts[baseName] = counter + 1;
-        nameCounts[newName] = 1;
-        return newName;
-    };
-
-    profiles.forEach((p) => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts
-            ? p.userPorts
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean)
-            : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach((hName) => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map((e) => e.ip);
-            let ips = calcEffectiveIps(
-                allIps,
-                maxCfg,
-                effectiveMode,
-                effectivePorts,
-                pips.length
-            );
-            let ipNameMap = {};
-            ipEntries.forEach((e) => {
-                ipNameMap[e.ip] = e.name;
-            });
-            effectivePorts.forEach((port) => {
-                let sec = getTransportParams(port) === "tls" ? "true" : "false";
-                ips.forEach((ip) => {
-                    let _pips = pips.length > 0 ? pips : [null];
-                    _pips.forEach((selectedProxyIp) => {
-                    let ipName = ipNameMap[ip] || "";
-                    if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let vName = getConfigName(
-                            "alpha",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            selectedProxyIp,
-                            configIndex,
-                            ipName,
-                        );
-                        vName = getUniqueName(vName);
-                        proxyNames.push(`"${vName}"`);
-                        proxyGeoInfo.set(
-                            vName,
-                            getGeoInfo(selectedProxyIp || ip),
-                        );
-                        let randomJunk = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadVl = {
-                            junk: randomJunk,
-                            protocol: "vl",
-                            mode: "proxyip",
-                            panelIPs: [],
-                        };
-                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(
-                            configUuid,
-                            p.id,
-                            selectedProxyIp || "",
-                        );
-                        proxies.push(
-                            `- name: "${vName.replace(/"/g, '""')}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`,
-                        );
-                    }
-                    if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let tName = getConfigName(
-                            "beta",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            selectedProxyIp,
-                            configIndex,
-                            ipName,
-                        );
-                        tName = getUniqueName(tName);
-                        proxyNames.push(`"${tName}"`);
-                        proxyGeoInfo.set(
-                            tName,
-                            getGeoInfo(selectedProxyIp || ip),
-                        );
-                        let randomJunkTr = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadTr = {
-                            junk: randomJunkTr,
-                            protocol: "tr",
-                            mode: "proxyip",
-                            panelIPs: [],
-                            relayIdx: configIndex,
-                        };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        proxies.push(
-                            `- name: "${tName.replace(/"/g, '""')}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`,
-                        );
-                    }
-                    configIndex++;
-                    if (sysConfig.enableDirectConfigs && pips.length > 0 && selectedProxyIp === pips[0]) {
-                        let dcIndex = configIndex;
-                        if (
-                            effectiveMode === "alpha" ||
-                            effectiveMode === "both"
-                        ) {
-                            let dvName = getUniqueName(
-                                getConfigName(
-                                    "alpha",
-                                    p.name,
-                                    port,
-                                    hName,
-                                    ip,
-                                    null,
-                                    dcIndex,
-                                    ipName,
-                                    true
-                                ),
-                            );
-                            proxyNames.push(`"${dvName}"`);
-                            proxyGeoInfo.set(dvName, getGeoInfo(ip));
-                            let randomJunk = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadVl = {
-                                junk: randomJunk,
-                                protocol: "vl",
-                                mode: "proxyip",
-                                panelIPs: [],
-                            };
-                            let pathStrVl =
-                                "/" + btoa(JSON.stringify(payloadVl));
-                            let configUuid = generateConfigUuid(p.id, dcIndex);
-                            registerConfigEntry(configUuid, p.id, "");
-                            proxies.push(
-                                `- name: "${dvName.replace(/"/g, '""')}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`,
-                            );
-                        }
-                        if (
-                            effectiveMode === "beta" ||
-                            effectiveMode === "both"
-                        ) {
-                            let dtName = getUniqueName(
-                                getConfigName(
-                                    "beta",
-                                    p.name,
-                                    port,
-                                    hName,
-                                    ip,
-                                    null,
-                                    dcIndex,
-                                    ipName,
-                                    true
-                                ),
-                            );
-                            proxyNames.push(`"${dtName}"`);
-                            proxyGeoInfo.set(dtName, getGeoInfo(ip));
-                            let randomJunk = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadTr = {
-                                junk: randomJunk,
-                                protocol: "tr",
-                                mode: "proxyip",
-                                panelIPs: [],
-                                relayIdx: configIndex,
-                            };
-                            let pathStrTr =
-                                "/" + btoa(JSON.stringify(payloadTr));
-                            let randomJunkDt = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadDt = {
-                                junk: randomJunkDt,
-                                protocol: "tr",
-                                mode: "proxyip",
-                                panelIPs: [],
-                                relayIdx: dcIndex,
-                            };
-                            let pathStrDt =
-                                "/" + btoa(JSON.stringify(payloadDt));
-                            proxies.push(
-                                `- name: "${dtName.replace(/"/g, '""')}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrDt}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`,
-                            );
-                        }
-                        configIndex++;
-                    }
-                    });
-                });
-            });
-        });
-    });
-
-    // ─── Upstream chaining: add upstream proxy to YAML ───
-    let parsedUpstreamYaml = parseVlessUri(sysConfig.upstreamUri);
-    let upstreamNameYaml = "";
-    if (parsedUpstreamYaml) {
-        let upProxy = upstreamToClashProxy(parsedUpstreamYaml);
-        upstreamNameYaml = upProxy.name;
-        let upYaml = `- name: "${upProxy.name.replace(/"/g, '""')}"
-  type: ${getAlpha()}
-  server: ${upProxy.server}
-  port: ${upProxy.port}
-  uuid: ${upProxy.uuid}
-  udp: true
-  tls: ${upProxy.tls}
-  servername: ${upProxy.servername}
-  client-fingerprint: ${upProxy["client-fingerprint"] || "random"}
-  skip-cert-verify: ${upProxy["skip-cert-verify"]}
-  network: ${upProxy.network}
-  ws-opts:
-    path: "${upProxy["ws-opts"]?.path || "/"}"
-    headers:
-      Host: ${upProxy["ws-opts"]?.headers?.Host || upProxy.servername}`;
-        proxies.unshift(upYaml);
-        proxyNames.unshift(`"${upProxy.name}"`);
-    }
-
-    // Build per-country groups from geo info
-    let countryGroups = new Map(); // "country" -> {flag, proxies[]}
-    proxyGeoInfo.forEach((geo, name) => {
-        let key = geo.country || "Unknown";
-        if (!countryGroups.has(key)) {
-            countryGroups.set(key, { flag: geo.flag || "🌐", proxies: [] });
-        }
-        countryGroups.get(key).proxies.push(name);
-    });
-    let sortedCountries = Array.from(countryGroups.entries()).sort((a, b) =>
-        a[0].localeCompare(b[0]),
-    );
-
-    // Build proxy-groups YAML
-    let groupsYaml =
-        "proxy-groups:\n" +
-        '  - name: "✅ Selector"\n' +
-        "    type: select\n" +
-        "    proxies:\n" +
-        '      - "⚡ Fastest"\n' +
-        '      - "🖐 Manual"\n';
-    sortedCountries.forEach(([country, info]) => {
-        groupsYaml += `      - "${info.flag} ${country}"\n`;
-    });
-
-    // Fastest — url-test with ALL proxies
-    groupsYaml +=
-        '\n  - name: "⚡ Fastest"\n' +
-        "    type: url-test\n" +
-        '    url: "https://www.gstatic.com/generate_204"\n' +
-        "    interval: 30\n" +
-        "    tolerance: 50\n" +
-        "    proxies:\n";
-    proxyNames.forEach((n) => {
-        groupsYaml += `      - ${n}\n`;
-    });
-
-    // Manual — select with ALL proxies
-    groupsYaml +=
-        '\n  - name: "🖐 Manual"\n' + "    type: select\n" + "    proxies:\n";
-    proxyNames.forEach((n) => {
-        groupsYaml += `      - ${n}\n`;
-    });
-
-    // Per-country url-test groups
-    sortedCountries.forEach(([country, info]) => {
-        groupsYaml +=
-            `\n  - name: "${info.flag} ${country}"\n` +
-            "    type: url-test\n" +
-            '    url: "https://www.gstatic.com/generate_204"\n' +
-            "    interval: 30\n" +
-            "    tolerance: 50\n" +
-            "    proxies:\n";
-        info.proxies.forEach((name) => {
-            groupsYaml += `      - "${name}"\n`;
-        });
-    });
-
-    let cr = getCustomRouting();
-    let customRules = [];
-    cr.domains.forEach(d => {
-        customRules.push(`  - DOMAIN,${d},DIRECT`);
-        customRules.push(`  - DOMAIN-SUFFIX,${d},DIRECT`);
-    });
-    cr.ips.forEach(ip => {
-        customRules.push(`  - IP-CIDR,${ip},DIRECT`);
-    });
-    cr.geoips.forEach(g => {
-        customRules.push(`  - GEOIP,${g},DIRECT`);
-    });
-    cr.geosites.forEach(g => {
-        customRules.push(`  - GEOSITE,${g},DIRECT`);
-    });
-
-    let rulesOutput = customRules.length > 0 
-        ? customRules.join("\n") 
-        : `  - DOMAIN-SUFFIX,ir,DIRECT
-  - DOMAIN-KEYWORD,gov.ir,DIRECT
-  - DOMAIN-SUFFIX,fa,DIRECT
-  - GEOIP,IR,DIRECT`;
-
-    return `mixed-port: 7890
-ipv6: true
-allow-lan: false
-unified-delay: false
-log-level: warning
-mode: rule
-disable-keep-alive: false
-keep-alive-idle: 10
-keep-alive-interval: 15
-tcp-concurrent: true
-geo-auto-update: true
-geo-update-interval: 168
-external-controller: 127.0.0.1:9090
-external-controller-cors:
-  allow-origins:
-    - "*"
-  allow-private-network: true
-external-ui: ui
-external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
-
-profile:
-  store-selected: true
-  store-fake-ip: true
-
-dns:
-  enable: true
-  respect-rules: true
-  use-system-hosts: false
-  listen: 127.0.0.1:1053
-  ipv6: true
-  hosts:
-    "rule-set:category-ads-all": "rcode://refused"
-  nameserver:
-    - "https://8.8.8.8/dns-query#✅ Selector"
-  proxy-server-nameserver:
-    - "8.8.8.8#DIRECT"
-  direct-nameserver:
-    - "8.8.8.8#DIRECT"
-  direct-nameserver-follow-policy: true
-  enhanced-mode: redir-host
-
-tun:
-  enable: true
-  stack: mixed
-  auto-route: true
-  strict-route: true
-  auto-detect-interface: true
-  dns-hijack:
-    - "any:53"
-    - "tcp://any:53"
-  mtu: 9000
-
-sniffer:
-  enable: true
-  force-dns-mapping: true
-  parse-pure-ip: true
-  override-destination: true
-  sniff:
-    HTTP:
-      ports: [80, 8080, 8880, 2052, 2082, 2086, 2095]
-    TLS:
-      ports: [443, 8443, 2053, 2083, 2087, 2096]
-
-proxies:
-${proxies.join("\n")}
-
-${groupsYaml}
-
-rules:
-${rulesOutput}
-  - MATCH,✅ Selector
-`;
+    return "";
 }
 
-// Obfuscated string keys to prevent Cloudflare scanners block on vpn/proxy keywords
-const k_pxs = "pro" + "xies";
-const k_px_gps = "pro" + "xy-gro" + "ups";
-const k_obds = "out" + "bounds";
-const k_vl_mode = "vl" + "ess";
-const k_tr_mode = "tro" + "jan";
-
-function getIpTypeLabel(ip) {
-    if (ip.includes(":") || ip.includes("[")) return "IPv6";
-    if (/^[0-9.]+$/.test(ip)) return "IPv4";
-    return "Domain";
+async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false, env = null) {
+    return {};
 }
-
-async function buildClashJsonProfile(
-    hostName,
-    targetSub = null,
-    allowInsecure = false,
-    env = null,
-) {
-    let ports = sysConfig.socketPorts
-        ? sysConfig.socketPorts
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-        : ["443"];
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [
-        ...new Set(profiles.flatMap((p) => getProfileHostNames(hostName, p))),
-    ];
-    await preloadIpFlags(profiles, allHostNames);
-    let proxyGeoInfo = new Map(); // proxyName -> {country, flag}
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-
-    let proxiesArr = [];
-    let dynamicTags = [];
-    let nameCounts = {};
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    let fakeRefs = [];
-    fakeNames.forEach((name) => {
-        proxiesArr.push({
-            name: name,
-            type: k_tr_mode,
-            server: "127.0.0.1",
-            port: 80,
-            password: activeDeviceId,
-            tls: false,
-            udp: true,
-        });
-        fakeRefs.push(name);
-    });
-
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) {
-            nameCounts[baseName] = 1;
-            return baseName;
-        }
-        let counter = nameCounts[baseName];
-        let newName = `${baseName}-${counter}`;
-        while (nameCounts[newName]) {
-            counter++;
-            newName = `${baseName}-${counter}`;
-        }
-        nameCounts[baseName] = counter + 1;
-        nameCounts[newName] = 1;
-        return newName;
-    };
-
-    profiles.forEach((p) => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts
-            ? p.userPorts
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean)
-            : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach((hName) => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map((e) => e.ip);
-            let ips = calcEffectiveIps(
-                allIps,
-                maxCfg,
-                effectiveMode,
-                effectivePorts,
-                pips.length
-            );
-            let ipNameMap = {};
-            ipEntries.forEach((e) => {
-                ipNameMap[e.ip] = e.name;
-            });
-            effectivePorts.forEach((port) => {
-                let sec = getTransportParams(port) === "tls";
-                ips.forEach((ip) => {
-                    let isVless =
-                        effectiveMode === "alpha" || effectiveMode === "both";
-                    let isTrojan =
-                        effectiveMode === "beta" || effectiveMode === "both";
-                    let _pips = pips.length > 0 ? pips : [null];
-                    _pips.forEach((selectedProxyIp) => {
-                    let ipName = ipNameMap[ip] || "";
-
-                    if (isVless) {
-                        let tagStr = getConfigName(
-                            "alpha",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            selectedProxyIp,
-                            configIndex,
-                            ipName,
-                        );
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-                        proxyGeoInfo.set(tagStr, getGeoInfo(selectedProxyIp || ip));
-
-                        let randomJunk = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadVl = {
-                            junk: randomJunk,
-                            protocol: "vl",
-                            mode: "proxyip",
-                            panelIPs: [],
-                        };
-                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(
-                            configUuid,
-                            p.id,
-                            selectedProxyIp || "",
-                        );
-
-                        let ob = {
-                            name: tagStr,
-                            type: k_vl_mode,
-                            server: ip,
-                            port: parseInt(port),
-                            "ip-version": "ipv4-prefer",
-                            tfo: sysConfig.enableOpt1 || false,
-                            udp: true,
-                            uuid: configUuid,
-                            "packet-encoding": "xudp",
-                            tls: sec,
-                            servername: hName,
-                            "client-fingerprint": sysConfig.agent || "random",
-                            "skip-cert-verify": allowInsecure,
-                            alpn: ["http/1.1"],
-                            network: "ws",
-                            "ws-opts": {
-                                path: pathStrVl,
-                                "max-early-data": 2560,
-                                "early-data-header-name":
-                                    "Sec-WebSocket-Protocol",
-                                headers: {
-                                    Host: hName,
-                                },
-                            },
-                        };
-                        if (sysConfig.enableOpt2) {
-                            ob["ech-opts"] = {
-                                enable: true,
-                                config: "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
-                            };
-                        }
-                        proxiesArr.push(ob);
-                    }
-
-                    if (isTrojan) {
-                        let tagStr = getConfigName(
-                            "beta",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            selectedProxyIp,
-                            configIndex,
-                            ipName,
-                        );
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-                        proxyGeoInfo.set(tagStr, getGeoInfo(selectedProxyIp || ip));
-
-                        let randomJunk = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadTr = {
-                            junk: randomJunk,
-                            protocol: "tr",
-                            mode: "proxyip",
-                            panelIPs: [],
-                            relayIdx: configIndex,
-                        };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-
-                        let configUuid2 = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(
-                            configUuid2,
-                            p.id,
-                            selectedProxyIp || "",
-                        );
-
-                        let ob = {
-                            name: tagStr,
-                            type: k_tr_mode,
-                            server: ip,
-                            port: parseInt(port),
-                            "ip-version": "ipv4-prefer",
-                            tfo: sysConfig.enableOpt1 || false,
-                            udp: true,
-                            password: p.id,
-                            "packet-encoding": "xudp",
-                            tls: sec,
-                            sni: hName,
-                            "client-fingerprint": sysConfig.agent || "random",
-                            "skip-cert-verify": allowInsecure,
-                            alpn: ["http/1.1"],
-                            network: "ws",
-                            "ws-opts": {
-                                path: pathStrTr,
-                                "max-early-data": 2560,
-                                "early-data-header-name":
-                                    "Sec-WebSocket-Protocol",
-                                headers: {
-                                    Host: hName,
-                                },
-                            },
-                        };
-                        if (sysConfig.enableOpt2) {
-                            ob["ech-opts"] = {
-                                enable: true,
-                                config: "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
-                            };
-                        }
-                        proxiesArr.push(ob);
-                    }
-                    configIndex++;
-                    if (sysConfig.enableDirectConfigs && pips.length > 0 && selectedProxyIp === pips[0]) {
-                        if (isVless) {
-                            let tagStr = getUniqueName(
-                                getConfigName(
-                                    "alpha",
-                                    p.name,
-                                    port,
-                                    hName,
-                                    ip,
-                                    null,
-                                    configIndex,
-                                    ipName, true
-                                ),
-                            );
-                            dynamicTags.push(tagStr);
-                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
-                            let randomJunk = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadVl = {
-                                junk: randomJunk,
-                                protocol: "vl",
-                                mode: "proxyip",
-                                panelIPs: [],
-                            };
-                            let pathStrVl =
-                                "/" + btoa(JSON.stringify(payloadVl));
-                            let configUuid = generateConfigUuid(
-                                p.id,
-                                configIndex,
-                            );
-                            registerConfigEntry(configUuid, p.id, "");
-                            let ob = {
-                                name: tagStr,
-                                type: k_vl_mode,
-                                server: ip,
-                                port: parseInt(port),
-                                "ip-version": "ipv4-prefer",
-                                tfo: sysConfig.enableOpt1 || false,
-                                udp: true,
-                                uuid: configUuid,
-                                "packet-encoding": "xudp",
-                                tls: sec,
-                                servername: hName,
-                                "client-fingerprint":
-                                    sysConfig.agent || "random",
-                                "skip-cert-verify": allowInsecure,
-                                alpn: ["http/1.1"],
-                                network: "ws",
-                                "ws-opts": {
-                                    path: pathStrVl,
-                                    "max-early-data": 2560,
-                                    "early-data-header-name":
-                                        "Sec-WebSocket-Protocol",
-                                    headers: { Host: hName },
-                                },
-                            };
-                            if (sysConfig.enableOpt2)
-                                ob["ech-opts"] = {
-                                    enable: true,
-                                    config: "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
-                                };
-                            proxiesArr.push(ob);
-                        }
-                        if (isTrojan) {
-                            let tagStr = getUniqueName(
-                                getConfigName(
-                                    "beta",
-                                    p.name,
-                                    port,
-                                    hName,
-                                    ip,
-                                    null,
-                                    configIndex,
-                                    ipName, true
-                                ),
-                            );
-                            dynamicTags.push(tagStr);
-                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
-                            let randomJunk = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadTr = {
-                                junk: randomJunk,
-                                protocol: "tr",
-                                mode: "proxyip",
-                                panelIPs: [],
-                                relayIdx: configIndex,
-                            };
-                            let pathStrTr =
-                                "/" + btoa(JSON.stringify(payloadTr));
-                            let configUuid2 = generateConfigUuid(
-                                p.id,
-                                configIndex,
-                            );
-                            let ob = {
-                                name: tagStr,
-                                type: k_tr_mode,
-                                server: ip,
-                                port: parseInt(port),
-                                "ip-version": "ipv4-prefer",
-                                tfo: sysConfig.enableOpt1 || false,
-                                udp: true,
-                                password: p.id,
-                                "packet-encoding": "xudp",
-                                tls: sec,
-                                sni: hName,
-                                "client-fingerprint":
-                                    sysConfig.agent || "random",
-                                "skip-cert-verify": allowInsecure,
-                                alpn: ["http/1.1"],
-                                network: "ws",
-                                "ws-opts": {
-                                    path: pathStrTr,
-                                    "max-early-data": 2560,
-                                    "early-data-header-name":
-                                        "Sec-WebSocket-Protocol",
-                                    headers: { Host: hName },
-                                },
-                            };
-                            if (sysConfig.enableOpt2)
-                                ob["ech-opts"] = {
-                                    enable: true,
-                                    config: "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
-                                };
-                            proxiesArr.push(ob);
-                        }
-                        configIndex++;
-                    }
-                    });
-                });
-            });
-        });
-    });
-
-    if (dynamicTags.length === 0) { dynamicTags.push("direct"); }
-
-    // ─── Upstream chaining: add upstream proxy ───
-    let parsedUpstream = parseVlessUri(sysConfig.upstreamUri);
-    let upstreamProxyName = "";
-    if (parsedUpstream) {
-        let upstreamProxy = upstreamToClashProxy(parsedUpstream);
-        upstreamProxyName = upstreamProxy.name;
-        proxiesArr.unshift(upstreamProxy);
-        dynamicTags.unshift(upstreamProxyName);
-    }
-
-    // Build per-country groups from geo info
-    let countryGroups = new Map(); // "country" -> {flag, proxies[]}
-    proxyGeoInfo.forEach((geo, name) => {
-        let key = geo.country || "Unknown";
-        if (!countryGroups.has(key)) {
-            countryGroups.set(key, { flag: geo.flag || "🌐", proxies: [] });
-        }
-        countryGroups.get(key).proxies.push(name);
-    });
-    let sortedCountries = Array.from(countryGroups.entries()).sort((a, b) =>
-        a[0].localeCompare(b[0]),
-    );
-
-    // Build proxy-groups JSON
-    let groupsJson = [
-        {
-            name: "✅ Selector",
-            type: "select",
-            proxies: [
-                "⚡ Fastest",
-                "🖐 Manual",
-                ...sortedCountries.map(([c, info]) => `${info.flag} ${c}`),
-            ],
-        },
-        {
-            name: "⚡ Fastest",
-            type: "url-test",
-            url: "https://www.gstatic.com/generate_204",
-            interval: 30,
-            tolerance: 50,
-            proxies: dynamicTags,
-        },
-        { name: "🖐 Manual", type: "select", proxies: dynamicTags },
-        ...sortedCountries.map(([country, info]) => ({
-            name: `${info.flag} ${country}`,
-            type: "url-test",
-            url: "https://www.gstatic.com/generate_204",
-            interval: 30,
-            tolerance: 50,
-            proxies: info.proxies,
-        })),
-    ];
-
-    let cr = getCustomRouting();
-    let jsonCustomRules = [];
-    cr.domains.forEach(d => {
-        jsonCustomRules.push(`DOMAIN,${d},DIRECT`);
-        jsonCustomRules.push(`DOMAIN-SUFFIX,${d},DIRECT`);
-    });
-    cr.ips.forEach(ip => {
-        jsonCustomRules.push(`IP-CIDR,${ip},DIRECT,no-resolve`);
-    });
-    cr.geoips.forEach(g => {
-        jsonCustomRules.push(`GEOIP,${g},DIRECT,no-resolve`);
-    });
-    cr.geosites.forEach(g => {
-        jsonCustomRules.push(`GEOSITE,${g},DIRECT`);
-    });
-
-    return {
-        "mixed-port": 7890,
-        ipv6: true,
-        "allow-lan": false,
-        "unified-delay": false,
-        "log-level": "warning",
-        mode: "rule",
-        "disable-keep-alive": false,
-        "keep-alive-idle": 10,
-        "keep-alive-interval": 15,
-        "tcp-concurrent": true,
-        "geo-auto-update": true,
-        "geo-update-interval": 168,
-        "external-controller": "127.0.0.1:9090",
-        "external-controller-cors": {
-            "allow-origins": ["*"],
-            "allow-private-network": true,
-        },
-        "external-ui": "ui",
-        "external-ui-url":
-            "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
-        profile: {
-            "store-selected": true,
-            "store-fake-ip": true,
-        },
-        dns: {
-            enable: true,
-            "respect-rules": true,
-            "use-system-hosts": false,
-            listen: "127.0.0.1:1053",
-            ipv6: true,
-            hosts: {
-                "rule-set:category-ads-all": "rcode://refused",
-            },
-            nameserver: ["https://8.8.8.8/dns-query#✅ Selector"],
-            "proxy-server-nameserver": ["8.8.8.8#DIRECT"],
-            "direct-nameserver": ["8.8.8.8#DIRECT"],
-            "direct-nameserver-follow-policy": true,
-            "nameserver-policy": {
-                "rule-set:ir": "8.8.8.8#DIRECT",
-            },
-            "enhanced-mode": "redir-host",
-        },
-        tun: {
-            enable: true,
-            stack: "mixed",
-            "auto-route": true,
-            "strict-route": true,
-            "auto-detect-interface": true,
-            "dns-hijack": ["any:53", "tcp://any:53"],
-            mtu: 9000,
-        },
-        sniffer: {
-            enable: true,
-            "force-dns-mapping": true,
-            "parse-pure-ip": true,
-            "override-destination": true,
-            sniff: {
-                HTTP: {
-                    ports: [80, 8080, 8880, 2052, 2082, 2086, 2095],
-                },
-                TLS: {
-                    ports: [443, 8443, 2053, 2083, 2087, 2096],
-                },
-            },
-        },
-        [k_pxs]: proxiesArr,
-        [k_px_gps]: groupsJson,
-        "rule-providers": {
-            "category-ads-all": {
-                type: "http",
-                format: "text",
-                behavior: "domain",
-                path: "./ruleset/category-ads-all.txt",
-                interval: 86400,
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/category-ads-all.txt",
-            },
-            ir: {
-                type: "http",
-                format: "text",
-                behavior: "domain",
-                path: "./ruleset/ir.txt",
-                interval: 86400,
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/ir.txt",
-            },
-            "ir-cidr": {
-                type: "http",
-                format: "text",
-                behavior: "ipcidr",
-                path: "./ruleset/ir-cidr.txt",
-                interval: 86400,
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/ircidr.txt",
-            },
-        },
-        rules: [
-            "GEOIP,lan,DIRECT,no-resolve",
-            "NETWORK,udp,REJECT",
-            "RULE-SET,category-ads-all,REJECT",
-            ...jsonCustomRules,
-            "RULE-SET,ir,DIRECT",
-            "RULE-SET,ir-cidr,DIRECT",
-            "MATCH,✅ Selector",
-        ],
-        ntp: {
-            enable: true,
-            server: "time.cloudflare.com",
-            port: 123,
-            interval: 30,
-        },
-    };
-}
-
 
 async function buildVJsonProfile(hostName, targetSub = null, allowInsecure = false, env = null) {
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(",").map(s => s.trim()).filter(Boolean) : ["443"];
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
-    await preloadIpFlags(profiles, allHostNames);
-    
-    let outboundsArr = [];
-    let configIndex = 0;
-    let nameCounts = {};
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) { nameCounts[baseName] = 1; return baseName; }
-        let c = nameCounts[baseName]; nameCounts[baseName] = c + 1; return baseName + '-' + c;
-    };
-
-    profiles.forEach((p) => {
-        let maxCfg = p.maxConfigs || 0;
-        let pips = [];
-        if (p.relayIps && p.relayIps.length > 0) pips = [...p.relayIps];
-        else if (sysConfig.customRelay && sysConfig.customRelay.trim() !== "") {
-            pips = sysConfig.customRelay.split(",").map(r => r.trim()).filter(Boolean);
-        }
-        
-        let hostNamesToUse = getProfileHostNames(hostName, p);
-        hostNamesToUse.forEach(hName => {
-            p.ipLists.forEach(ipList => {
-                let ips = ipList.ips;
-                let effectiveMode = ipList.mode || sysConfig.mode || "both";
-                let effectivePorts = (ipList.ports && ipList.ports.length > 0) ? ipList.ports : ports;
-                if (maxCfg > 0) ips = calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts, pips.length);
-                let ipNameMap = {};
-                if (ipList.entries) ipList.entries.forEach(e => ipNameMap[e.ip] = e.name);
-                
-                effectivePorts.forEach(port => {
-                    let sec = (getTransportParams(port) === "tls") ? "tls" : "none";
-                    ips.forEach(ip => {
-                        let _pips = pips.length > 0 ? pips : [null];
-                        _pips.forEach((selectedProxyIp) => {
-                        let ipName = ipNameMap[ip] || "";
-                        
-                        if (effectiveMode === "alpha" || effectiveMode === "both") {
-                            let tag = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName));
-                            let configUuid = generateConfigUuid(p.id, configIndex);
-                            let randomJunk = Array.from({length:11}, ()=> "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random()*62)]).join("");
-                            let payload = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let path = "/" + btoa(JSON.stringify(payload));
-                            
-                            let ob = {
-                                tag: tag,
-                                protocol: "vless",
-                                settings: {
-                                    vnext: [{ address: ip, port: parseInt(port), users: [{ id: configUuid, encryption: "none" }] }]
-                                },
-                                streamSettings: {
-                                    network: "ws",
-                                    security: sec,
-                                    tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure } : undefined,
-                                    wsSettings: { path: path, headers: { Host: hName } }
-                                }
-                            };
-                            outboundsArr.push(ob);
-                        }
-                        
-                        if (effectiveMode === "beta" || effectiveMode === "both") {
-                            let tag = getUniqueName(getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName));
-                            let randomJunk = Array.from({length:11}, ()=> "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random()*62)]).join("");
-                            let payload = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let path = "/" + btoa(JSON.stringify(payload));
-                            
-                            let ob = {
-                                tag: tag,
-                                protocol: "trojan",
-                                settings: {
-                                    servers: [{ address: ip, port: parseInt(port), password: p.id }]
-                                },
-                                streamSettings: {
-                                    network: "ws",
-                                    security: sec,
-                                    tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure } : undefined,
-                                    wsSettings: { path: path, headers: { Host: hName } }
-                                }
-                            };
-                            outboundsArr.push(ob);
-                        }
-                        configIndex++;
-                    });
-                    });
-                });
-            });
-        });
-    });
-
-    // ─── Upstream chaining: add upstream outbound ───
-    let parsedUpstream = parseVlessUri(sysConfig.upstreamUri);
-    if (parsedUpstream) {
-        let upstreamOb = upstreamToV2RayOb(parsedUpstream);
-        // Add proxySettings to chain through upstream
-        outboundsArr.forEach(ob => {
-            if (ob.protocol !== "direct" && ob.protocol !== "freedom" && ob.protocol !== "blackhole") {
-                ob.proxySettings = { tag: upstreamOb.tag, transportSeries: [] };
-            }
-        });
-        outboundsArr.unshift(upstreamOb);
-    }
-
-    await fetchTemplates(env);
-    if (VTemplate) {
-        let tpl = JSON.parse(JSON.stringify(VTemplate));
-        let newOutbounds = [];
-        
-        for (let ob of tpl.outbounds) {
-            if (ob === "__OUTBOUNDS__") {
-                newOutbounds.push(...outboundsArr);
-            } else {
-                newOutbounds.push(ob);
-            }
-        }
-        if (newOutbounds.length === 0) newOutbounds = outboundsArr;
-        tpl.outbounds = newOutbounds;
-        
-        // Inject Custom Routing
-        let cr = getCustomRouting();
-        if (cr.domains.length > 0) {
-            tpl.route.rules.unshift({ domain: cr.domains, outbound: "direct" });
-            tpl.route.rules.unshift({ domain_suffix: cr.domains, outbound: "direct" });
-        }
-        if (cr.ips.length > 0) {
-            tpl.route.rules.unshift({ ip_cidr: cr.ips, outbound: "direct" });
-        }
-        if (cr.geoips.length > 0) {
-            tpl.route.rules.unshift({ geoip: cr.geoips, outbound: "direct" });
-        }
-        if (cr.geosites.length > 0) {
-            tpl.route.rules.unshift({ geosite: cr.geosites, outbound: "direct" });
-        }
-        
-        return tpl;
-
-    }
-    return { outbounds: outboundsArr };
+    return {};
 }
+
 async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false, env = null) {
-    let ports = sysConfig.socketPorts
-        ? sysConfig.socketPorts
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-        : ["443"];
-    let profiles = getAllProfiles(targetSub);
-    let allHostNames = [
-        ...new Set(profiles.flatMap((p) => getProfileHostNames(hostName, p))),
-    ];
-    await preloadIpFlags(profiles, allHostNames);
-    let proxyGeoInfo = new Map(); // proxyName -> {country, flag}
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-
-    let outboundsArr = [];
-    let dynamicTags = [];
-    let nameCounts = {};
-
-    // Add fake configs
-    let fakeNames = getFakeConfigNames(targetSub);
-    let fakeRefs = [];
-    fakeNames.forEach((name) => {
-        outboundsArr.push({
-            type: "direct",
-            tag: name,
-        });
-        fakeRefs.push(name);
-    });
-
-    const getUniqueName = (baseName) => {
-        if (!nameCounts[baseName]) {
-            nameCounts[baseName] = 1;
-            return baseName;
-        }
-        let counter = nameCounts[baseName];
-        let newName = `${baseName}-${counter}`;
-        while (nameCounts[newName]) {
-            counter++;
-            newName = `${baseName}-${counter}`;
-        }
-        nameCounts[baseName] = counter + 1;
-        nameCounts[newName] = 1;
-        return newName;
-    };
-
-    profiles.forEach((p) => {
-        let pips = getEffectivePips(p);
-        let effectiveMode = p.userMode || sysConfig.mode;
-        let effectivePorts = p.userPorts
-            ? p.userPorts
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean)
-            : ports;
-        let maxCfg = p.maxConfigs || null;
-
-        let configIndex = 0;
-        let profileHostNames = getProfileHostNames(hostName, p);
-
-        profileHostNames.forEach((hName) => {
-            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
-            let allIps = ipEntries.map((e) => e.ip);
-            let ips = calcEffectiveIps(
-                allIps,
-                maxCfg,
-                effectiveMode,
-                effectivePorts,
-                pips.length
-            );
-            let ipNameMap = {};
-            ipEntries.forEach((e) => {
-                ipNameMap[e.ip] = e.name;
-            });
-            effectivePorts.forEach((port) => {
-                let sec = getTransportParams(port) === "tls";
-                ips.forEach((ip) => {
-                    let isVless =
-                        effectiveMode === "alpha" || effectiveMode === "both";
-                    let isTrojan =
-                        effectiveMode === "beta" || effectiveMode === "both";
-                    let _pips = pips.length > 0 ? pips : [null];
-                    _pips.forEach((selectedProxyIp) => {
-                    let ipName = ipNameMap[ip] || "";
-
-                    if (isVless) {
-                        let tagStr = getConfigName(
-                            "alpha",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            selectedProxyIp,
-                            configIndex,
-                            ipName,
-                        );
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-
-                        let randomJunk = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadVl = {
-                            junk: randomJunk,
-                            protocol: "vl",
-                            mode: "proxyip",
-                            panelIPs: [],
-                        };
-                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-
-                        let configUuid = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(
-                            configUuid,
-                            p.id,
-                            selectedProxyIp || "",
-                        );
-
-                        let ob = {
-                            type: k_vl_mode,
-                            tag: tagStr,
-                            server: ip,
-                            server_port: parseInt(port),
-                            tcp_fast_open: sysConfig.enableOpt1 || false,
-                            uuid: configUuid,
-                            packet_encoding: "xudp",
-                            network: "tcp",
-                            tls: {
-                                enabled: sec,
-                                server_name: hName,
-                                insecure: allowInsecure,
-                                alpn: ["http/1.1"],
-                                utls: {
-                                    enabled: true,
-                                    fingerprint: "randomized",
-                                },
-                            },
-                            transport: {
-                                type: "ws",
-                                path: pathStrVl,
-                                max_early_data: 2560,
-                                early_data_header_name:
-                                    "Sec-WebSocket-Protocol",
-                                headers: {
-                                    Host: hName,
-                                },
-                            },
-                        };
-                        outboundsArr.push(ob);
-                    }
-
-                    if (isTrojan) {
-                        let tagStr = getConfigName(
-                            "beta",
-                            p.name,
-                            port,
-                            hName,
-                            ip,
-                            selectedProxyIp,
-                            configIndex,
-                            ipName,
-                        );
-                        tagStr = getUniqueName(tagStr);
-                        dynamicTags.push(tagStr);
-
-                        let randomJunk = Array.from(
-                            { length: 11 },
-                            () =>
-                                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                    Math.floor(Math.random() * 62)
-                                ],
-                        ).join("");
-                        let payloadTr = {
-                            junk: randomJunk,
-                            protocol: "tr",
-                            mode: "proxyip",
-                            panelIPs: [],
-                            relayIdx: configIndex,
-                        };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-
-                        let configUuid2 = generateConfigUuid(p.id, configIndex);
-                        registerConfigEntry(
-                            configUuid2,
-                            p.id,
-                            selectedProxyIp || "",
-                        );
-
-                        let ob = {
-                            type: k_tr_mode,
-                            tag: tagStr,
-                            server: ip,
-                            server_port: parseInt(port),
-                            tcp_fast_open: sysConfig.enableOpt1 || false,
-                            password: p.id,
-                            network: "tcp",
-                            tls: {
-                                enabled: sec,
-                                server_name: hName,
-                                insecure: allowInsecure,
-                                alpn: ["http/1.1"],
-                                utls: {
-                                    enabled: true,
-                                    fingerprint: "randomized",
-                                },
-                            },
-                            transport: {
-                                type: "ws",
-                                path: pathStrTr,
-                                max_early_data: 2560,
-                                early_data_header_name:
-                                    "Sec-WebSocket-Protocol",
-                                headers: {
-                                    Host: hName,
-                                },
-                            },
-                        };
-                        outboundsArr.push(ob);
-                    }
-                    configIndex++;
-                    if (sysConfig.enableDirectConfigs && pips.length > 0 && selectedProxyIp === pips[0]) {
-                        if (isVless) {
-                            let tagStr = getUniqueName(
-                                getConfigName(
-                                    "alpha",
-                                    p.name,
-                                    port,
-                                    hName,
-                                    ip,
-                                    null,
-                                    configIndex,
-                                    ipName, true
-                                ),
-                            );
-                            dynamicTags.push(tagStr);
-                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
-                            let randomJunk = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadVl = {
-                                junk: randomJunk,
-                                protocol: "vl",
-                                mode: "proxyip",
-                                panelIPs: [],
-                            };
-                            let pathStrVl =
-                                "/" + btoa(JSON.stringify(payloadVl));
-                            let configUuid = generateConfigUuid(
-                                p.id,
-                                configIndex,
-                            );
-                            registerConfigEntry(configUuid, p.id, "");
-                            let ob = {
-                                type: k_vl_mode,
-                                tag: tagStr,
-                                server: ip,
-                                server_port: parseInt(port),
-                                tcp_fast_open: sysConfig.enableOpt1 || false,
-                                uuid: configUuid,
-                                packet_encoding: "xudp",
-                                network: "tcp",
-                                tls: {
-                                    enabled: sec,
-                                    server_name: hName,
-                                    insecure: allowInsecure,
-                                    alpn: ["http/1.1"],
-                                    utls: {
-                                        enabled: true,
-                                        fingerprint: "randomized",
-                                    },
-                                },
-                                transport: {
-                                    type: "ws",
-                                    path: pathStrVl,
-                                    max_early_data: 2560,
-                                    early_data_header_name:
-                                        "Sec-WebSocket-Protocol",
-                                    headers: { Host: hName },
-                                },
-                            };
-                            outboundsArr.push(ob);
-                        }
-                        if (isTrojan) {
-                            let tagStr = getUniqueName(
-                                getConfigName(
-                                    "beta",
-                                    p.name,
-                                    port,
-                                    hName,
-                                    ip,
-                                    null,
-                                    configIndex,
-                                    ipName, true
-                                ),
-                            );
-                            dynamicTags.push(tagStr);
-                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
-                            let randomJunk = Array.from(
-                                { length: 11 },
-                                () =>
-                                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[
-                                        Math.floor(Math.random() * 62)
-                                    ],
-                            ).join("");
-                            let payloadTr = {
-                                junk: randomJunk,
-                                protocol: "tr",
-                                mode: "proxyip",
-                                panelIPs: [],
-                                relayIdx: configIndex,
-                            };
-                            let pathStrTr =
-                                "/" + btoa(JSON.stringify(payloadTr));
-                            let configUuid2 = generateConfigUuid(
-                                p.id,
-                                configIndex,
-                            );
-                            let ob = {
-                                type: k_tr_mode,
-                                tag: tagStr,
-                                server: ip,
-                                server_port: parseInt(port),
-                                tcp_fast_open: sysConfig.enableOpt1 || false,
-                                password: p.id,
-                                network: "tcp",
-                                tls: {
-                                    enabled: sec,
-                                    server_name: hName,
-                                    insecure: allowInsecure,
-                                    alpn: ["http/1.1"],
-                                    utls: {
-                                        enabled: true,
-                                        fingerprint: "randomized",
-                                    },
-                                },
-                                transport: {
-                                    type: "ws",
-                                    path: pathStrTr,
-                                    max_early_data: 2560,
-                                    early_data_header_name:
-                                        "Sec-WebSocket-Protocol",
-                                    headers: { Host: hName },
-                                },
-                            };
-                            outboundsArr.push(ob);
-                        }
-                        configIndex++;
-                    }
-                    });
-                });
-            });
-        });
-    });
-
-    if (dynamicTags.length === 0) {
-        dynamicTags.push("direct");
-    }
-
-    // ─── Upstream chaining: add detour to all outbounds ───
-    let parsedUpstream = parseVlessUri(sysConfig.upstreamUri);
-    let upstreamTag = "";
-    if (parsedUpstream) {
-        let upstreamOb = upstreamToSingboxOb(parsedUpstream);
-        upstreamTag = upstreamOb.tag;
-        // Add detour to all generated outbounds so they chain through upstream
-        outboundsArr.forEach(ob => {
-            if (ob.type !== "direct" && ob.type !== "block" && ob.type !== "dns") {
-                ob.detour = upstreamTag;
-            }
-        });
-        // Insert upstream as first outbound
-        outboundsArr.unshift(upstreamOb);
-    }
-    
-    await fetchTemplates(env);
-    if (singboxTemplate) {
-        let tpl = JSON.parse(JSON.stringify(singboxTemplate));
-        let newOutbounds = [];
-        let allProxies = outboundsArr.map(o => o.tag);
-        
-        for (let ob of tpl.outbounds) {
-            if (ob === "__OUTBOUNDS__") {
-                newOutbounds.push(...outboundsArr);
-            } else if (ob.outbounds && ob.outbounds.includes("{all_proxies}")) {
-                let obCpy = { ...ob };
-                obCpy.outbounds = [];
-                for (let tag of ob.outbounds) {
-                    if (tag === "{all_proxies}") obCpy.outbounds.push(...allProxies);
-                    else obCpy.outbounds.push(tag);
-                }
-                newOutbounds.push(obCpy);
-            } else {
-                newOutbounds.push(ob);
-            }
-        }
-        tpl.outbounds = newOutbounds;
-        return tpl;
-    }
-    // Fallback if template fails
-    return {
-        log: { disabled: false, level: "warn", timestamp: true },
-        dns: { servers: [], rules: [] },
-        inbounds: [],
-        [k_obds]: outboundsArr,
-        route: { rules: [] }
-    };
+    return {};
 }
